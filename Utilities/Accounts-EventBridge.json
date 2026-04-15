@@ -1,0 +1,13 @@
+{
+  "source": ["aws.controltower"],
+  "detail-type": ["AWS Service Event via CloudTrail"],
+  "detail": {
+    "eventSource": ["controltower.amazonaws.com"],
+    "eventName": ["UpdateManagedAccount"],
+    "serviceEventDetails": {
+      "updateManagedAccountStatus": {
+        "state": ["SUCCEEDED"]
+      }
+    }
+  }
+}

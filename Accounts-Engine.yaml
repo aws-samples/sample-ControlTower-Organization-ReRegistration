@@ -1,0 +1,1625 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Control Tower Account Re-registeration automation. Targets only Control Tower-managed Accounts,
+  skips the core accounts discovered from the landing zone manifest, skips, for all details, please refer to https://github.com/aws-samples/sample-ControlTower-Organization-ReRegistration
+
+Parameters:
+  EnableEventRule:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: "When set to true, AccountsEngine function will continue to update all provisioned products created by Accounts Factory"
+
+  MaxInChange:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 10
+    Description: "if a quota limit increase was requested for Concurrent account operations quota, please match the value"
+
+
+  TagStartedKey:
+    Type: String
+    Default: UpdateStarted
+    Description: "Tag used by AccountsEngine lambda to mark when the update operation was started."
+
+  TagCompletedKey:
+    Type: String
+    Default: UpdateCompleted
+    Description: "Tag used by AccountsEngine lambda to mark when the update operation was finished, combined with the operation ID."
+
+  IdentityCenterRegion:
+    Type: String
+    AllowedPattern: '^[a-z]{2}(-gov)?-[a-z]+-\d$'
+    ConstraintDescription: "Must be a valid AWS region of the current partition."
+    Description: "Region where Identity Center is created"
+
+  AutoAddLambdaRoleToPortoflioAccess:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: "If true, Stack will automatically associate the AccountsEngine Lambda role with the Account Factory portfolio to allow the UpdateProvisionedProduct API, if false, the user must manually associate the role."
+
+  AutomationTargetAccountId:
+    Type: String
+    Default: ''
+    AllowedPattern: '(^$|^\d{12}$)'
+    ConstraintDescription: 'Must be empty or a 12-digit AWS account ID.'
+    Description: "If set, The stack will trigger lambda to update the provisioned product and tag it accordingly, this will allow the lifecycle to trigger the automation, if not provided, user must manually update 1 account to trigger the automation"
+
+Conditions:
+  EventRuleEnabled: !Equals [!Ref EnableEventRule, 'true']
+  HasAutomationTargetAccount: !Not [!Equals [!Ref AutomationTargetAccountId, '']]
+  AutoAddPortfolioAccessEnabled: !Equals [!Ref AutoAddLambdaRoleToPortoflioAccess, 'true']
+  HasTargetAndAutoAdd: !And [!Condition HasAutomationTargetAccount, !Condition AutoAddPortfolioAccessEnabled]
+  HasTargetAndNoAutoAdd: !And [!Condition HasAutomationTargetAccount, !Not [!Condition AutoAddPortfolioAccessEnabled]]
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "ControlTower Organization ReRegistration Automation"
+        Parameters:
+          - EnableEventRule
+          - MaxInChange
+          - TagStartedKey
+          - TagCompletedKey
+          - IdentityCenterRegion
+      -        
+        Label:
+          default: "Optional parameters"
+        Parameters:
+          - AutomationTargetAccountId
+    ParameterLabels:
+        EnableEventRule:
+          default: Activate Or DeactivateThe EventBridge Rule
+        MaxInChange:
+          default: Concurrent account operations
+        TagStartedKey:
+          default: Update Operation Started Tag
+        TagCompletedKey:
+          default: Update Operation Completed Tag
+        AutoAddLambdaRoleToPortoflioAccess:
+          default: Auto-associate Lambda role with Account Factory portfolio
+        IdentityCenterRegion:
+          default: Identity Center region
+        AutomationTargetAccountId:
+          default: Account ID to update first
+
+Resources:
+
+  AccountsEngineLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-accounts-engine
+      RetentionInDays: 365
+
+  AccountsEngineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: engine-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-accounts-engine:*
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-accounts-starter:*
+        - PolicyName: engine-actions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: OrganizationsReadAndTag
+                Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:DescribeAccount
+                  - organizations:ListParents
+                  - organizations:ListRoots
+                  - organizations:ListOrganizationalUnitsForParent
+                  - organizations:DescribeOrganizationalUnit
+                  - organizations:ListAccountsForParent
+                  - organizations:ListTagsForResource
+                  - organizations:TagResource
+                Resource: "*"
+              - Sid: ServiceCatalogAccountFactoryUpdate
+                Effect: Allow
+                Action:
+                  - servicecatalog:SearchProvisionedProducts
+                  - servicecatalog:DescribeProvisionedProduct
+                  - servicecatalog:ListProvisioningArtifacts
+                  - servicecatalog:ListRecordHistory
+                  - servicecatalog:DescribeProvisioningParameters
+                  - servicecatalog:DescribeRecord
+                  - servicecatalog:UpdateProvisionedProduct
+                Resource: "*"
+              - Sid: ControlTowerLandingZoneRead
+                Effect: Allow
+                Action:
+                  - controltower:ListLandingZones
+                  - controltower:GetLandingZone
+                  - controltower:DescribeManagedAccount
+                  - controltower:CreateManagedAccount
+                Resource: "*"
+              - Sid: IdentityCenterRead
+                Effect: Allow
+                Action:
+                  - sso:ListInstances
+                  - sso:GetProfile
+                  - sso:CreateProfile
+                  - sso:UpdateProfile
+                  - sso:GetTrust
+                  - sso:CreateTrust
+                  - sso:UpdateTrust
+                  - sso:GetApplicationInstance
+                  - sso:CreateApplicationInstance
+                  - identitystore:GetUserId
+                  - identitystore:DescribeUser
+                  - sso:DescribeRegisteredRegions
+                  - sso:ListDirectoryAssociations
+                  - sso-directory:DescribeDirectory
+                  - sso:GetSSOStatus
+                  - cloudformation:GetTemplateSummary
+                  - sso-directory:SearchGroups
+                  - sso:ListPermissionSets
+                  - sso-directory:CreateUser
+                  - sso-directory:SearchUsers
+                  - sso:ListProfileAssociations
+                Resource: "*"
+
+  AccountsEngineFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - AccountsEngineLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-accounts-engine
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !GetAtt AccountsEngineRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          MAX_IN_CHANGE: !Ref MaxInChange
+          TAG_STARTED: !Ref TagStartedKey
+          TAG_COMPLETED: !Ref TagCompletedKey
+          IDENTITY_CENTER_REGION: !Ref IdentityCenterRegion
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import logging
+          from datetime import datetime, timezone
+
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+          CFG = Config(retries={"max_attempts": 10, "mode": "standard"})
+
+          MAX_IN_CHANGE = int(os.getenv("MAX_IN_CHANGE", "1"))
+          TAG_STARTED = os.getenv("TAG_STARTED", "UpdateStarted")
+          TAG_COMPLETED = os.getenv("TAG_COMPLETED", "UpdateCompleted")
+          IDENTITY_CENTER_REGION = (os.getenv("IDENTITY_CENTER_REGION") or "").strip()
+
+          _CACHE = {
+              "mgmt": None,
+              "identity_store_id": None,
+              "ou_name": {},
+              "acct_name": {},
+              "lz_core_accounts": None,
+          }
+
+          def _now() -> str:
+              return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+          def _safe_tag_value(ts: str, op_id: str | None) -> str:
+              op_id = (op_id or "").strip()
+              s = f"{ts} record {op_id}".strip()
+              return s[:240]
+
+          def _extract_completed_account(event: dict) -> tuple[str | None, str | None]:
+              d = (event or {}).get("detail") or {}
+              sed = d.get("serviceEventDetails") or {}
+              st = sed.get("updateManagedAccountStatus") or {}
+              if st.get("state") != "SUCCEEDED":
+                  return None, None
+              acct = st.get("account") or {}
+              return acct.get("accountId"), st.get("completedTimestamp")
+
+          def _tag_resource(org, resource_id: str, key: str, value: str):
+              org.tag_resource(ResourceId=resource_id, Tags=[{"Key": key, "Value": value}])
+
+          def _tag_account_if_exists(org, account_id: str, key: str, value: str):
+              # Avoid failing the whole invocation due to a bad/placeholder test payload or a closed account.
+              try:
+                  org.describe_account(AccountId=account_id)
+                  _tag_resource(org, account_id, key, value)
+                  log.info("Tagged account %s with %s=%s", account_id, key, value)
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  if code in ("AccountNotFoundException", "TargetNotFoundException"):
+                      log.warning("Skip tagging %s (%s): %s", account_id, key, code)
+                      return
+                  raise
+
+          def _tag_keys(org, resource_id: str) -> set[str]:
+              """Return tag keys for a resource using a single API call (reduces throttling)."""
+              try:
+                  tags = org.list_tags_for_resource(ResourceId=resource_id).get("Tags", []) or []
+                  return {t.get("Key") for t in tags if t.get("Key")}
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  # If an account disappears/gets closed mid-run, skip it rather than failing the whole invocation.
+                  if code in ("AccountNotFoundException", "TargetNotFoundException"):
+                      return set()
+                  raise
+
+          def _has_tag(org, resource_id: str, key: str) -> bool:
+              tags = org.list_tags_for_resource(ResourceId=resource_id).get("Tags", []) or []
+              return any(t.get("Key") == key for t in tags)
+
+          def _management_account_id(org) -> str | None:
+              if _CACHE["mgmt"] is None:
+                  o = org.describe_organization()["Organization"]
+                  _CACHE["mgmt"] = o.get("ManagementAccountId") or o.get("MasterAccountId")
+              return _CACHE["mgmt"]
+
+          def _account_name(org, account_id: str) -> str:
+              cached = _CACHE.get("acct_name", {}).get(account_id)
+              if cached is not None:
+                  return cached
+              try:
+                  resp = org.describe_account(AccountId=account_id)
+                  name = ((resp.get("Account") or {}).get("Name") or "").strip()
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  if code in ("AccountNotFoundException", "TargetNotFoundException"):
+                      name = ""
+                  else:
+                      raise
+              _CACHE.setdefault("acct_name", {})[account_id] = name
+              return name
+
+          def _get_landing_zone_identifier(ct) -> str | None:
+              try:
+                  resp = ct.list_landing_zones()
+              except ClientError as e:
+                  log.warning("ListLandingZones failed: %s", (e.response.get("Error") or {}).get("Code", ""))
+                  return None
+
+              lzs = resp.get("landingZones") or resp.get("LandingZones") or []
+              if not lzs:
+                  return None
+
+              first = lzs[0]
+              if isinstance(first, str):
+                  return first
+              return first.get("arn") or first.get("Arn")
+
+          def _core_accounts_from_landing_zone_manifest(ct) -> set[str]:
+              # Uses landing zone manifest to identify the true core accounts (security + log archive).
+              cached = _CACHE.get("lz_core_accounts")
+              if cached is not None:
+                  return cached
+
+              core: set[str] = set()
+              lz_id = _get_landing_zone_identifier(ct)
+              if not lz_id:
+                  log.info("Landing zone identifier not found (no landing zones returned).")
+                  _CACHE["lz_core_accounts"] = core
+                  return core
+
+              try:
+                  resp = ct.get_landing_zone(landingZoneIdentifier=lz_id)
+              except TypeError:
+                  resp = ct.get_landing_zone(LandingZoneIdentifier=lz_id)
+              except ClientError as e:
+                  log.warning("GetLandingZone failed: %s", (e.response.get("Error") or {}).get("Code", ""))
+                  _CACHE["lz_core_accounts"] = core
+                  return core
+
+              lz = resp.get("landingZone") or resp.get("LandingZone") or {}
+              manifest = lz.get("manifest") or lz.get("Manifest") or {}
+
+              if isinstance(manifest, str):
+                  try:
+                      manifest = json.loads(manifest)
+                  except Exception:
+                      manifest = {}
+
+              sec = (manifest.get("securityRoles") or {})
+              clog = (manifest.get("centralizedLogging") or {})
+
+              sec_id = (sec.get("accountId") or "").strip()
+              log_id = (clog.get("accountId") or "").strip()
+
+              if sec_id:
+                  core.add(sec_id)
+              if log_id:
+                  core.add(log_id)
+
+              log.info("Landing zone core accounts from manifest: %s", sorted(core) if core else "(none found)")
+              _CACHE["lz_core_accounts"] = core
+              return core
+
+          def _iter_ou_ids(org):
+              roots = org.list_roots().get("Roots", []) or []
+              p = org.get_paginator("list_organizational_units_for_parent")
+
+              def walk(parent_id: str):
+                  for page in p.paginate(ParentId=parent_id):
+                      for ou in page.get("OrganizationalUnits", []) or []:
+                          yield ou["Id"]
+                          yield from walk(ou["Id"])
+
+              for r in roots:
+                  yield from walk(r["Id"])
+
+          def _ou_name(org, ou_id: str) -> str:
+              cached = _CACHE["ou_name"].get(ou_id)
+              if cached is not None:
+                  return cached
+              resp = org.describe_organizational_unit(OrganizationalUnitId=ou_id)
+              name = (resp.get("OrganizationalUnit") or {}).get("Name") or ""
+              _CACHE["ou_name"][ou_id] = name
+              return name
+
+          def _iter_accounts_for_ou(org, ou_id: str):
+              p = org.get_paginator("list_accounts_for_parent")
+              for page in p.paginate(ParentId=ou_id):
+                  for a in page.get("Accounts", []) or []:
+                      yield a
+
+          def _get_pp_for_account(sc, account_id: str) -> dict | None:
+              resp = sc.search_provisioned_products(Filters={"SearchQuery": [f"physicalId:{account_id}"]})
+              pps = resp.get("ProvisionedProducts", []) or []
+              if not pps:
+                  return None
+              pps.sort(key=lambda x: x.get("CreatedTime") or 0, reverse=True)
+              return pps[0]
+
+          def _pp_in_change_now(sc, ppid: str) -> bool:
+              st = (sc.describe_provisioned_product(Id=ppid).get("ProvisionedProductDetail") or {}).get("Status") or ""
+              return st in ("UNDER_CHANGE", "PLAN_IN_PROGRESS")
+
+          def _count_pps_under_change(sc, limit: int) -> int:
+              count = 0
+              token = None
+              while True:
+                  kwargs = {"PageSize": 20}
+                  if token:
+                      kwargs["PageToken"] = token
+                  resp = sc.search_provisioned_products(**kwargs)
+                  for pp in resp.get("ProvisionedProducts", []) or []:
+                      st = (pp.get("Status") or "")
+                      if st in ("UNDER_CHANGE", "PLAN_IN_PROGRESS"):
+                          count += 1
+                          if count >= limit:
+                              return count
+                  token = resp.get("NextPageToken")
+                  if not token:
+                      return count
+
+          def _active_pa(sc, product_id: str, fallback: str | None) -> str | None:
+              resp = sc.list_provisioning_artifacts(ProductId=product_id)
+              arts = resp.get("ProvisioningArtifactDetails", []) or []
+              active = [a for a in arts if a.get("Active") is True and a.get("Id")]
+              if active:
+                  active.sort(key=lambda x: x.get("CreatedTime") or 0)
+                  return active[-1]["Id"]
+              arts = [a for a in arts if a.get("Id")]
+              if arts:
+                  arts.sort(key=lambda x: x.get("CreatedTime") or 0)
+                  return arts[-1]["Id"]
+              return fallback
+
+          def _last_success_record_id(sc, ppjson: dict) -> str | None:
+              rid = (ppjson or {}).get("LastSuccessfulProvisioningRecordId")
+              if rid:
+                  return rid
+              ppid = (ppjson or {}).get("Id")
+              if not ppid:
+                  return None
+              resp = sc.list_record_history(SearchFilter={"Key": "provisionedproduct", "Value": ppid})
+              recs = [
+                  r for r in (resp.get("RecordDetails", []) or [])
+                  if r.get("Status") == "SUCCEEDED" and r.get("RecordId")
+              ]
+              if not recs:
+                  return None
+              recs.sort(key=lambda r: r.get("CreatedTime") or 0)
+              return recs[-1]["RecordId"]
+
+          def _record_outputs_map(sc, record_id: str | None) -> dict:
+              if not record_id:
+                  return {}
+              r = sc.describe_record(Id=record_id)
+              outs = r.get("RecordOutputs", []) or []
+              m = {}
+              for o in outs:
+                  k = o.get("OutputKey")
+                  v = o.get("OutputValue")
+                  if k and v is not None and str(v).strip():
+                      m[k] = str(v).strip()
+              return m
+
+          def _discover_identity_store_id(sso_admin) -> str | None:
+              if _CACHE["identity_store_id"] is not None:
+                  return _CACHE["identity_store_id"] or None
+              try:
+                  inst = sso_admin.list_instances()
+                  instances = inst.get("Instances", []) or []
+                  active = [i for i in instances if (i.get("Status") or "").upper() == "ACTIVE"]
+                  pick = (active[0] if active else (instances[0] if instances else None)) or {}
+                  _CACHE["identity_store_id"] = pick.get("IdentityStoreId") or ""
+                  return _CACHE["identity_store_id"] or None
+              except ClientError as e:
+                  log.warning("Unable to list SSO instances: %s", (e.response.get("Error") or {}).get("Code", ""))
+                  _CACHE["identity_store_id"] = ""
+                  return None
+
+          def _resolve_first_last_by_email(identitystore, identity_store_id: str | None, email: str | None) -> tuple[str, str]:
+              if not identity_store_id or not email:
+                  return "", ""
+              try:
+                  alt = {"UniqueAttribute": {"AttributePath": "emails.value", "AttributeValue": email}}
+                  uid = identitystore.get_user_id(IdentityStoreId=identity_store_id, AlternateIdentifier=alt).get("UserId")
+                  if not uid:
+                      return "", ""
+                  u = identitystore.describe_user(IdentityStoreId=identity_store_id, UserId=uid)
+                  name = u.get("Name") or {}
+                  return (name.get("GivenName") or "").strip(), (name.get("FamilyName") or "").strip()
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  log.info("Identity lookup failed for %s: %s", email, code)
+                  return "", ""
+
+          def _pick(out: dict, *keys: str) -> str:
+              for k in keys:
+                  v = out.get(k)
+                  if v and str(v).strip():
+                      return str(v).strip()
+              return ""
+
+          def lambda_handler(event, context):
+              if not IDENTITY_CENTER_REGION:
+                  log.error("Missing required IdentityCenterRegion (IDENTITY_CENTER_REGION env var).")
+                  return {"status": "error", "message": "Missing required IdentityCenterRegion (IDENTITY_CENTER_REGION env var)."}
+
+              org = boto3.client("organizations", config=CFG)
+              sc = boto3.client("servicecatalog", config=CFG)
+              sso = boto3.client("sso-admin", region_name=IDENTITY_CENTER_REGION, config=CFG)
+              ids = boto3.client("identitystore", region_name=IDENTITY_CENTER_REGION, config=CFG)
+              ct = boto3.client("controltower", config=CFG)  # landing zone manifest lookup (assumes current region is Control Tower home region)
+
+              log.info("MAX_IN_CHANGE=%d TAG_STARTED=%s TAG_COMPLETED=%s",
+                       MAX_IN_CHANGE, TAG_STARTED, TAG_COMPLETED)
+
+              # 1) Mark completed account from lifecycle event
+              completed_acct, completed_ts = _extract_completed_account(event)
+              if completed_acct and completed_ts:
+                  _tag_account_if_exists(org, completed_acct, TAG_COMPLETED, completed_ts)
+
+              # 2) Respect global max concurrency
+              in_change = _count_pps_under_change(sc, MAX_IN_CHANGE)
+              slots = max(0, MAX_IN_CHANGE - in_change)
+              log.info("Currently UNDER_CHANGE/PLAN_IN_PROGRESS=%d; slots available=%d", in_change, slots)
+              if slots == 0:
+                  return {"status": "no-slots", "in_change": in_change, "max": MAX_IN_CHANGE}
+
+              mgmt_id = _management_account_id(org)
+              lz_core = _core_accounts_from_landing_zone_manifest(ct)
+              ignore_ids = {x for x in ([mgmt_id] if mgmt_id else [])} | set(lz_core)
+
+              log.info("Ignoring accounts (mgmt + landing zone core): %s", sorted(ignore_ids) if ignore_ids else "(none)")
+              identity_store_id = _discover_identity_store_id(sso)
+              log.info("IdentityStoreId: %s", identity_store_id or "(not found)")
+
+              started = 0
+
+              # 3) OU-ordered processing, nested OUs supported
+              for ou_id in _iter_ou_ids(org):
+                  if started >= slots:
+                      break
+
+                  ou_name = _ou_name(org, ou_id).strip()
+                  if not ou_name:
+                      continue
+
+                  for acct in _iter_accounts_for_ou(org, ou_id):
+                      if started >= slots:
+                          break
+
+                      acct_id = acct["Id"]
+                      acct_name = (_account_name(org, acct_id) or (acct.get("Name") or "")).strip()
+                      acct_status = (acct.get("Status") or "").upper()
+
+                      if acct_id in ignore_ids:
+                          continue
+                      if acct_status != "ACTIVE":
+                          continue
+                      # Process only accounts with NO automation tags at all.
+                      # This prevents edge cases where someone manually tags an account and we still continue
+                      # scanning to find the next eligible untagged account.
+                      tag_keys = _tag_keys(org, acct_id)
+                      if (TAG_STARTED in tag_keys) or (TAG_COMPLETED in tag_keys):
+                          continue
+
+                      # Only update accounts that are managed by Account Factory (PP exists)
+                      pp = _get_pp_for_account(sc, acct_id)
+                      if not pp:
+                          continue
+
+                      ppid = pp.get("Id")
+                      product_id = pp.get("ProductId")
+                      pa_current = pp.get("ProvisioningArtifactId")
+                      ppname = (pp.get("Name") or "").strip()
+                      account_name = (acct_name or ppname or acct_id).strip()
+                      ppstatus = (pp.get("Status") or "").strip()
+
+                      if not ppid or not product_id:
+                          continue
+                      if ppstatus in ("UNDER_CHANGE", "PLAN_IN_PROGRESS"):
+                          continue
+                      if _pp_in_change_now(sc, ppid):
+                          continue
+
+                      pa_active = _active_pa(sc, product_id, pa_current)
+                      if not pa_active:
+                          continue
+
+                      rid = _last_success_record_id(sc, pp)
+                      out = _record_outputs_map(sc, rid)
+
+                      acct_email = _pick(
+                          out,
+                          "AccountEmail", "accountEmail",
+                          "NewAccountEmail", "newAccountEmail",
+                          "ManagedAccountEmail",
+                      )
+                      sso_email = _pick(
+                          out,
+                          "SSOUserEmail", "SsoUserEmail",
+                          "SSOUserEmailAddress", "SSOUserEmailId",
+                          "UserEmail", "userEmail",
+                      )
+
+                      first, last = _resolve_first_last_by_email(ids, identity_store_id, sso_email)
+
+                      if not acct_email or not sso_email or not first or not last:
+                          log.info(
+                              "Skipping acct=%s: missing required values (acct_email=%s sso_email=%s first=%s last=%s) record=%s",
+                              acct_id, bool(acct_email), bool(sso_email), bool(first), bool(last), rid
+                          )
+                          continue
+
+                      params = [
+                          {"Key": "AccountEmail", "Value": acct_email},
+                          {"Key": "AccountName", "Value": account_name},
+                          {"Key": "ManagedOrganizationalUnit", "Value": f"{ou_name} ({ou_id})"},
+                          {"Key": "SSOUserEmail", "Value": sso_email},
+                          {"Key": "SSOUserFirstName", "Value": first},
+                          {"Key": "SSOUserLastName", "Value": last},
+                          {"Key": "firstName", "Value": first},
+                          {"Key": "lastName", "Value": last},
+                      ]
+
+                      log.info(
+                          "Updating acct=%s (%s) OU=%s PP=%s product=%s PA_ACTIVE=%s record=%s",
+                          acct_id, account_name, ou_name, ppid, product_id, pa_active, rid
+                      )
+
+                      try:
+                          resp = sc.update_provisioned_product(
+                              ProvisionedProductId=ppid,
+                              ProductId=product_id,
+                              ProvisioningArtifactId=pa_active,
+                              ProvisioningParameters=params,
+                          )
+                      except ClientError as e:
+                          code = (e.response.get("Error") or {}).get("Code", "")
+                          msg = (e.response.get("Error") or {}).get("Message", "")
+                          log.warning("Update failed for acct=%s: %s %s", acct_id, code, msg)
+                          continue
+
+                      record_id = ((resp.get("RecordDetail") or {}).get("RecordId")) or ""
+                      start_value = _safe_tag_value(_now(), record_id)
+
+                      try:
+                          _tag_resource(org, acct_id, TAG_STARTED, start_value)
+                          log.info("Tagged acct=%s with %s=%s", acct_id, TAG_STARTED, start_value)
+                      except ClientError as e:
+                          code = (e.response.get("Error") or {}).get("Code", "")
+                          log.warning("Update started but failed to tag acct=%s: %s", acct_id, code)
+
+                      started += 1
+                      log.info("Started %d/%d updates this run (global max=%d).", started, slots, MAX_IN_CHANGE)
+
+              if started == 0:
+                  log.info("No eligible untagged managed accounts found (or all were skipped).")
+
+              return {"status": "started", "started": started, "slots": slots, "in_change": in_change, "max": MAX_IN_CHANGE}
+
+  AccountsTagsCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-accounts-tags-cleanup
+      RetentionInDays: 365
+
+  AccountsTagsCleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cleanup-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-accounts-tags-cleanup:*
+        - PolicyName: cleanup-actions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: OrganizationsListAndUntag
+                Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:ListTagsForResource
+                  - organizations:UntagResource
+                Resource: "*"
+
+  AccountsTagsCleanupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - AccountsTagsCleanupLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-accounts-tags-cleanup
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !GetAtt AccountsTagsCleanupRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          TAG_STARTED: !Ref TagStartedKey
+          TAG_COMPLETED: !Ref TagCompletedKey
+      Code:
+        ZipFile: |
+          import os
+          import logging
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+          CFG = Config(retries={"max_attempts": 10, "mode": "standard"})
+
+          TAG_STARTED = os.getenv("TAG_STARTED", "UpdateStarted")
+          TAG_COMPLETED = os.getenv("TAG_COMPLETED", "UpdateCompleted")
+
+          def _iter_accounts(org):
+              p = org.get_paginator("list_accounts")
+              for page in p.paginate():
+                  for a in page.get("Accounts", []) or []:
+                      yield a
+
+          def lambda_handler(event, context):
+              org = boto3.client("organizations", config=CFG)
+
+              scanned = 0
+              tags_removed = 0
+              errors = 0
+
+              for acct in _iter_accounts(org):
+                  acct_id = acct.get("Id")
+                  if not acct_id:
+                      continue
+                  status = (acct.get("Status") or "").upper()
+                  if status not in ("ACTIVE", "SUSPENDED"):
+                      continue
+                  scanned += 1
+                  try:
+                      tags = (org.list_tags_for_resource(ResourceId=acct_id).get("Tags", []) or [])
+                      keys = [t.get("Key") for t in tags if t.get("Key") in (TAG_STARTED, TAG_COMPLETED)]
+                      keys = [k for k in keys if k]
+                      if not keys:
+                          continue
+                      org.untag_resource(ResourceId=acct_id, TagKeys=keys)
+                      tags_removed += len(keys)
+                      log.info("Removed %s from %s", keys, acct_id)
+                  except ClientError as e:
+                      errors += 1
+                      code = (e.response.get("Error") or {}).get("Code", "")
+                      msg = (e.response.get("Error") or {}).get("Message", "")
+                      log.warning("Failed %s: %s %s", acct_id, code, msg)
+
+              return {"status": "ok", "scanned": scanned, "tags_removed": tags_removed, "errors": errors}
+
+  AccountsUpdateSucceededRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-accounts-update-succeeded
+      Description: "Triggers the engine Lambda when Control Tower UpdateManagedAccount succeeds."
+      State: !If [EventRuleEnabled, ENABLED, DISABLED]
+      EventPattern:
+        source:
+          - aws.controltower
+        detail-type:
+          - AWS Service Event via CloudTrail
+        detail:
+          eventSource:
+            - controltower.amazonaws.com
+          eventName:
+            - UpdateManagedAccount
+          serviceEventDetails:
+            updateManagedAccountStatus:
+              state:
+                - SUCCEEDED
+      Targets:
+        - Arn: !GetAtt AccountsEngineFunction.Arn
+          Id: AccountsEngineTarget
+
+  AllowEventBridgeInvokeEngine:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AccountsEngineFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AccountsUpdateSucceededRule.Arn
+
+
+  AllowCloudFormationInvokeStarter:
+    Condition: HasAutomationTargetAccount
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AccountsStarterFunction
+      Principal: cloudformation.amazonaws.com
+      SourceArn: !Ref AWS::StackId
+
+  AllowCloudFormationInvokePortfolioAccess:
+    Condition: AutoAddPortfolioAccessEnabled
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PortfolioAccessFunction
+      Principal: cloudformation.amazonaws.com
+      SourceArn: !Ref AWS::StackId
+
+  AccountsStarterLogGroup:
+    Condition: HasAutomationTargetAccount
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-accounts-starter
+      RetentionInDays: 365
+
+  AccountsStarterFunction:
+    Condition: HasAutomationTargetAccount
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - AccountsStarterLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-accounts-starter
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !GetAtt AccountsEngineRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          TAG_STARTED: !Ref TagStartedKey
+          AUTOMATION_TARGET_ACCOUNT_ID: !Ref AutomationTargetAccountId
+          IDENTITY_CENTER_REGION: !Ref IdentityCenterRegion
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import logging
+          import traceback
+          import urllib.request
+          from datetime import datetime, timezone
+          
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+          
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+          
+          CFG = Config(retries={"max_attempts": 10, "mode": "standard"})
+          
+          TAG_STARTED = os.getenv("TAG_STARTED", "UpdateStarted")
+          IDENTITY_CENTER_REGION = (os.getenv("IDENTITY_CENTER_REGION") or "").strip()
+          AUTOMATION_TARGET_ACCOUNT_ID = os.getenv("AUTOMATION_TARGET_ACCOUNT_ID", "")
+          
+          _CACHE = {
+              "identity_store_id": None,
+              "acct_name": {},
+          }
+          
+          
+          def _now() -> str:
+              return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+          
+          
+          def _safe_tag_value(ts: str, op_id: str | None) -> str:
+              op_id = (op_id or "").strip()
+              s = f"{ts} record {op_id}".strip()
+              return s[:240]
+          
+          
+          def _normalize_account_id(v: str | None) -> str | None:
+              v = (v or "").strip()
+              if not v:
+                  return None
+              if v.isdigit() and len(v) == 12:
+                  return v
+              return None
+          
+          
+          
+          
+          def _account_name(org, account_id: str) -> str:
+              cached = _CACHE.get("acct_name", {}).get(account_id)
+              if cached is not None:
+                  return cached
+              try:
+                  resp = org.describe_account(AccountId=account_id)
+                  name = ((resp.get("Account") or {}).get("Name") or "").strip()
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  if code in ("AccountNotFoundException", "TargetNotFoundException"):
+                      name = ""
+                  else:
+                      raise
+              _CACHE.setdefault("acct_name", {})[account_id] = name
+              return name
+
+          def _get_current_ou_name(org, account_id: str) -> str:
+              # Resolve the account's CURRENT parent OU (or Root) name so we can pass it back to Account Factory
+              # without changing the OU placement.
+              resp = org.list_parents(ChildId=account_id)
+              parents = resp.get("Parents") or []
+              if not parents:
+                  raise Exception(f"No parent found for accountId {account_id}")
+          
+              parent = parents[0]
+              ptype = (parent.get("Type") or "").strip()
+              pid = (parent.get("Id") or "").strip()
+              if not pid:
+                  raise Exception(f"Parent Id is missing for accountId {account_id}")
+          
+              if ptype == "ORGANIZATIONAL_UNIT":
+                  ou = org.describe_organizational_unit(OrganizationalUnitId=pid).get("OrganizationalUnit") or {}
+                  name = (ou.get("Name") or "").strip()
+                  if not name:
+                      raise Exception(f"Unable to resolve OU Name for {pid}")
+                  return f"{name} ({pid})"
+          
+              if ptype == "ROOT":
+                  roots = (org.list_roots().get("Roots") or [])
+                  for r in roots:
+                      if r.get("Id") == pid:
+                          name = (r.get("Name") or "").strip()
+                          if not name:
+                              raise Exception(f"Unable to resolve Root Name for {pid}")
+                          return f"{name} ({pid})"
+                  raise Exception(f"Unable to find Root {pid}")
+          
+              raise Exception(f"Unsupported parent type {ptype} for accountId {account_id}")
+          def _send_cfn_response(event: dict, context, status: str, reason: str, data: dict | None = None, physical_id: str | None = None):
+              # Best-effort CloudFormation custom resource response sender.
+              try:
+                  response_url = (event or {}).get("ResponseURL")
+                  if not response_url:
+                      return
+          
+                  body = {
+                      "Status": status,
+                      "Reason": reason or f"See CloudWatch Log Stream: {getattr(context, 'log_stream_name', 'unknown')}",
+                      "PhysicalResourceId": physical_id or getattr(context, "log_stream_name", "AccountsStarterFunction"),
+                      "StackId": event.get("StackId"),
+                      "RequestId": event.get("RequestId"),
+                      "LogicalResourceId": event.get("LogicalResourceId"),
+                      "NoEcho": False,
+                      "Data": data or {},
+                  }
+          
+                  payload = json.dumps(body).encode("utf-8")
+                  req = urllib.request.Request(
+                      response_url,
+                      data=payload,
+                      headers={"content-type": "", "content-length": str(len(payload))},
+                      method="PUT",
+                  )
+                  with urllib.request.urlopen(req) as resp:
+                      log.info("Sent CloudFormation response: status=%s http=%s", status, getattr(resp, "status", "unknown"))
+              except Exception as e:
+                  log.warning("Failed to send CloudFormation response: %s", str(e))
+          
+          
+          def _tag_started(org, account_id: str, record_id: str | None):
+              value = _safe_tag_value(_now(), record_id)
+              org.tag_resource(ResourceId=account_id, Tags=[{"Key": TAG_STARTED, "Value": value}])
+              return value
+          
+          
+          def _get_pp_for_account(sc, account_id: str) -> dict | None:
+              resp = sc.search_provisioned_products(Filters={"SearchQuery": [f"physicalId:{account_id}"]})
+              pps = resp.get("ProvisionedProducts", []) or []
+              if not pps:
+                  return None
+              pps.sort(key=lambda x: x.get("CreatedTime") or 0, reverse=True)
+              return pps[0]
+          
+          
+          def _pp_in_change_now(sc, ppid: str) -> bool:
+              st = (sc.describe_provisioned_product(Id=ppid).get("ProvisionedProductDetail") or {}).get("Status") or ""
+              return st in ("UNDER_CHANGE", "PLAN_IN_PROGRESS")
+          
+          
+          def _active_pa(sc, product_id: str, fallback: str | None) -> str | None:
+              resp = sc.list_provisioning_artifacts(ProductId=product_id)
+              arts = resp.get("ProvisioningArtifactDetails", []) or []
+              active = [a for a in arts if a.get("Active") is True and a.get("Id")]
+              if active:
+                  active.sort(key=lambda x: x.get("CreatedTime") or 0)
+                  return active[-1]["Id"]
+              arts = [a for a in arts if a.get("Id")]
+              if arts:
+                  arts.sort(key=lambda x: x.get("CreatedTime") or 0)
+                  return arts[-1]["Id"]
+              return fallback
+          
+          
+          def _last_success_record_id(sc, ppjson: dict) -> str | None:
+              rid = (ppjson or {}).get("LastSuccessfulProvisioningRecordId")
+              if rid:
+                  return rid
+              ppid = (ppjson or {}).get("Id")
+              if not ppid:
+                  return None
+              resp = sc.list_record_history(SearchFilter={"Key": "provisionedproduct", "Value": ppid})
+              recs = [
+                  r for r in (resp.get("RecordDetails", []) or [])
+                  if r.get("Status") == "SUCCEEDED" and r.get("RecordId")
+              ]
+              if not recs:
+                  return None
+              recs.sort(key=lambda r: r.get("CreatedTime") or 0)
+              return recs[-1]["RecordId"]
+          
+          
+          def _record_outputs_map(sc, record_id: str | None) -> dict:
+              if not record_id:
+                  return {}
+              r = sc.describe_record(Id=record_id)
+              outs = r.get("RecordOutputs", []) or []
+              m = {}
+              for o in outs:
+                  k = o.get("OutputKey")
+                  v = o.get("OutputValue")
+                  if k and v is not None and str(v).strip():
+                      m[k] = str(v).strip()
+              return m
+          
+          
+          def _record_inputs_map(sc, record_id: str | None) -> dict:
+              if not record_id:
+                  return {}
+              r = sc.describe_record(Id=record_id)
+              ins = r.get("RecordInputs", []) or []
+              m = {}
+              for i in ins:
+                  k = i.get("Key")
+                  v = i.get("Value")
+                  if k and v is not None and str(v).strip():
+                      m[k] = str(v).strip()
+              return m
+          
+          
+          def _discover_identity_store_id(sso_admin) -> str | None:
+              if _CACHE["identity_store_id"] is not None:
+                  return _CACHE["identity_store_id"] or None
+              try:
+                  inst = sso_admin.list_instances()
+                  instances = inst.get("Instances", []) or []
+                  active = [i for i in instances if (i.get("Status") or "").upper() == "ACTIVE"]
+                  pick = (active[0] if active else (instances[0] if instances else None)) or {}
+                  _CACHE["identity_store_id"] = pick.get("IdentityStoreId") or ""
+                  return _CACHE["identity_store_id"] or None
+              except ClientError as e:
+                  log.warning("Unable to list SSO instances: %s", (e.response.get("Error") or {}).get("Code", ""))
+                  _CACHE["identity_store_id"] = ""
+                  return None
+          
+          
+          def _resolve_first_last_by_email(identitystore, identity_store_id: str | None, email: str | None) -> tuple[str, str]:
+              if not identity_store_id or not email:
+                  return "", ""
+              try:
+                  alt = {"UniqueAttribute": {"AttributePath": "emails.value", "AttributeValue": email}}
+                  uid = identitystore.get_user_id(IdentityStoreId=identity_store_id, AlternateIdentifier=alt).get("UserId")
+                  if not uid:
+                      return "", ""
+                  u = identitystore.describe_user(IdentityStoreId=identity_store_id, UserId=uid)
+                  name = u.get("Name") or {}
+                  return (name.get("GivenName") or "").strip(), (name.get("FamilyName") or "").strip()
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  log.info("Identity lookup failed for %s: %s", email, code)
+                  return "", ""
+          
+          
+          def _pick(out: dict, *keys: str) -> str:
+              for k in keys:
+                  v = out.get(k)
+                  if v and str(v).strip():
+                      return str(v).strip()
+              return ""
+          
+          
+          def _extract_target_account_id(event: dict) -> str | None:
+              rp = (event or {}).get("ResourceProperties") or {}
+              candidates = [
+                  rp.get("TargetAccountId"),
+                  rp.get("targetAccountId"),
+                  rp.get("AccountId"),
+                  rp.get("accountId"),
+                  (event or {}).get("TargetAccountId"),
+                  (event or {}).get("targetAccountId"),
+                  (event or {}).get("AccountId"),
+                  (event or {}).get("accountId"),
+                  AUTOMATION_TARGET_ACCOUNT_ID,
+              ]
+              for c in candidates:
+                  aid = _normalize_account_id(str(c) if c is not None else None)
+                  if aid:
+                      return aid
+              return None
+          
+          
+          def _run_single_account_update(account_id: str) -> dict:
+              # Single-account Account Factory update (no org enumeration).
+              sc = boto3.client("servicecatalog", config=CFG)
+              org = boto3.client("organizations", config=CFG)
+              sso = boto3.client("sso-admin", region_name=IDENTITY_CENTER_REGION, config=CFG)
+              ids = boto3.client("identitystore", region_name=IDENTITY_CENTER_REGION, config=CFG)
+          
+              account_id = _normalize_account_id(account_id)
+              if not account_id:
+                  return {"status": "error", "message": "Missing or invalid AccountId (expected 12-digit account ID)."}
+          
+              log.info("Single-account starter: accountId=%s tagStartedKey=%s",
+                       account_id, TAG_STARTED)
+          
+              account_name = _account_name(org, account_id)
+
+              pp = _get_pp_for_account(sc, account_id)
+              if not pp:
+                  return {
+                      "status": "not-found",
+                      "accountId": account_id,
+                      "accountName": account_name,
+                      "message": "No Service Catalog provisioned product found for this accountId (physicalId search).",
+                  }
+          
+              ppid = pp.get("Id")
+              product_id = pp.get("ProductId")
+              pa_current = pp.get("ProvisioningArtifactId")
+              ppname = (pp.get("Name") or "").strip()
+              account_name = (account_name or ppname or account_id).strip()
+              ppstatus = (pp.get("Status") or "").strip()
+          
+              if not ppid or not product_id:
+                  return {"status": "error", "accountId": account_id, "message": "Provisioned product missing Id or ProductId."}
+          
+              if ppstatus in ("UNDER_CHANGE", "PLAN_IN_PROGRESS") or _pp_in_change_now(sc, ppid):
+                  return {
+                      "status": "pp-in-change",
+                      "accountId": account_id,
+                      "provisionedProductId": ppid,
+                      "provisionedProductStatus": ppstatus,
+                  }
+          
+              pa_active = _active_pa(sc, product_id, pa_current)
+              if not pa_active:
+                  return {
+                      "status": "error",
+                      "accountId": account_id,
+                      "provisionedProductId": ppid,
+                      "message": "Unable to determine active provisioning artifact.",
+                  }
+          
+              rid = _last_success_record_id(sc, pp)
+              outs = _record_outputs_map(sc, rid)
+              ins = _record_inputs_map(sc, rid)
+          
+              acct_email = _pick(
+                  outs,
+                  "AccountEmail", "accountEmail",
+                  "NewAccountEmail", "newAccountEmail",
+                  "ManagedAccountEmail",
+              ) or _pick(ins, "AccountEmail", "accountEmail")
+          
+              sso_email = _pick(
+                  outs,
+                  "SSOUserEmail", "SsoUserEmail",
+                  "SSOUserEmailAddress", "SSOUserEmailId",
+                  "UserEmail", "userEmail",
+              ) or _pick(ins, "SSOUserEmail", "SsoUserEmail", "UserEmail", "userEmail")
+          
+              managed_ou = _get_current_ou_name(org, account_id)
+          
+              identity_store_id = _discover_identity_store_id(sso)
+              first, last = _resolve_first_last_by_email(ids, identity_store_id, sso_email)
+          
+              if not acct_email or not sso_email or not first or not last:
+                  return {
+                      "status": "missing-required",
+                      "accountId": account_id,
+                      "provisionedProductId": ppid,
+                      "recordId": rid,
+                      "missing": {
+                          "AccountEmail": (not bool(acct_email)),
+                          "SSOUserEmail": (not bool(sso_email)),
+                          "SSOUserFirstName": (not bool(first)),
+                          "SSOUserLastName": (not bool(last)),
+                      },
+                  }
+          
+              params = [
+                  {"Key": "AccountEmail", "Value": acct_email},
+                  {"Key": "AccountName", "Value": account_name},
+                  {"Key": "SSOUserEmail", "Value": sso_email},
+                  {"Key": "SSOUserFirstName", "Value": first},
+                  {"Key": "SSOUserLastName", "Value": last},
+                  {"Key": "firstName", "Value": first},
+                  {"Key": "lastName", "Value": last},
+              ]
+          
+              # Always pass the CURRENT OU name (resolved from Organizations) so the OU is non-null but not changed.
+              params.insert(2, {"Key": "ManagedOrganizationalUnit", "Value": managed_ou})
+          
+              log.info("Updating accountId=%s (%s) PP=%s product=%s PA_ACTIVE=%s record=%s managedOU=%s",
+                       account_id, account_name, ppid, product_id, pa_active, rid, managed_ou or "(not provided)")
+          
+              try:
+                  resp = sc.update_provisioned_product(
+                      ProvisionedProductId=ppid,
+                      ProductId=product_id,
+                      ProvisioningArtifactId=pa_active,
+                      ProvisioningParameters=params,
+                  )
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  msg = (e.response.get("Error") or {}).get("Message", "")
+                  log.warning("Update failed for accountId=%s: %s %s", account_id, code, msg)
+                  return {
+                      "status": "update-failed",
+                      "accountId": account_id,
+                      "provisionedProductId": ppid,
+                      "errorCode": code,
+                      "errorMessage": msg,
+                  }
+          
+              record_id = ((resp.get("RecordDetail") or {}).get("RecordId")) or ""
+          
+              tag_value = ""
+              try:
+                  tag_value = _tag_started(org, account_id, record_id)
+                  log.info("Tagged accountId=%s with %s=%s", account_id, TAG_STARTED, tag_value)
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  log.warning("Update started but failed to tag accountId=%s: %s", account_id, code)
+          
+              return {
+                  "status": "started",
+                  "accountId": account_id,
+                  "accountName": account_name,
+                  "provisionedProductId": ppid,
+                  "productId": product_id,
+                  "provisioningArtifactId": pa_active,
+                  "recordId": record_id,
+                  "ts": _now(),
+                  "managedOrganizationalUnit": managed_ou,
+                  "tagStartedKey": TAG_STARTED,
+                  "tagStartedValue": tag_value,
+              }
+          
+          
+          def lambda_handler(event, context):
+              # CloudFormation custom resource support:
+              # - Create/Update: start the update for the target account and immediately respond to CloudFormation.
+              # - Delete: no-op and respond SUCCESS.
+          
+              is_cfn = isinstance(event, dict) and "RequestType" in event and "ResponseURL" in event
+          
+          
+              if not IDENTITY_CENTER_REGION:
+                  msg = "Missing required IdentityCenterRegion (IDENTITY_CENTER_REGION env var)."
+                  log.error(msg)
+                  if is_cfn:
+                      _send_cfn_response(event, context, "FAILED", msg, data={"status": "error", "message": msg})
+                      return
+                  return {"status": "error", "message": msg}
+          
+              if not is_cfn:
+                  aid = _extract_target_account_id(event or {})
+                  if not aid:
+                      return {
+                          "status": "error",
+                          "message": "Missing or invalid AccountId/TargetAccountId (expected 12-digit account ID).",
+                          "example_event": {"AccountId": "123456789012"},
+                      }
+                  return _run_single_account_update(aid)
+          
+              req_type = (event.get("RequestType") or "").strip()
+              target = _extract_target_account_id(event)
+              physical_id = f"{getattr(context, 'function_name', 'AccountsStarterFunction')}-{target or 'unknown'}"
+          
+              try:
+                  if req_type == "Delete":
+                      _send_cfn_response(event, context, "SUCCESS", "Delete: no-op", data={"status": "deleted"}, physical_id=physical_id)
+                      return {"status": "deleted"}
+          
+                  if not target:
+                      _send_cfn_response(event, context, "FAILED", "Missing TargetAccountId/AccountId", data={}, physical_id=physical_id)
+                      return {"status": "error", "message": "Missing TargetAccountId/AccountId"}
+          
+                  result = _run_single_account_update(target)
+                  st = (result or {}).get("status") or ""
+          
+                  if st in ("started", "pp-in-change"):
+                      _send_cfn_response(event, context, "SUCCESS", st, data=result, physical_id=physical_id)
+                  else:
+                      _send_cfn_response(event, context, "FAILED", json.dumps(result)[:1024], data=result, physical_id=physical_id)
+          
+                  return result
+          
+              except Exception as e:
+                  log.error("Unhandled error: %s\n%s", str(e), traceback.format_exc())
+                  _send_cfn_response(event, context, "FAILED", f"Exception: {str(e)}", data={}, physical_id=physical_id)
+                  raise
+  StartAutomationCustomResourceWithPortfolioAccess:
+    Condition: HasTargetAndAutoAdd
+    Type: Custom::StartAccountsAutomation
+    DependsOn:
+      - AutoAddEngineRoleToAccountFactoryPortfolio
+      - AllowCloudFormationInvokeStarter
+      - AccountsUpdateSucceededRule
+    Properties:
+      ServiceToken: !GetAtt AccountsStarterFunction.Arn
+      TargetAccountId: !Ref AutomationTargetAccountId
+
+  StartAutomationCustomResource:
+    Condition: HasTargetAndNoAutoAdd
+    Type: Custom::StartAccountsAutomation
+    DependsOn:
+      - AllowCloudFormationInvokeStarter
+    Properties:
+      ServiceToken: !GetAtt AccountsStarterFunction.Arn
+      TargetAccountId: !Ref AutomationTargetAccountId
+
+  PortfolioAccessRole:
+    Condition: AutoAddPortfolioAccessEnabled
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: portfolio-access-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-portfolio-access:*
+        - PolicyName: portfolio-access-servicecatalog
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListAndAssociate
+                Effect: Allow
+                Action:
+                  - servicecatalog:ListPortfolios
+                  - servicecatalog:SearchProvisionedProducts
+                  - servicecatalog:DescribeProvisionedProduct
+                  - servicecatalog:ListLaunchPaths
+                  - servicecatalog:AssociatePrincipalWithPortfolio
+                  - servicecatalog:DisassociatePrincipalFromPortfolio
+                Resource: "*"
+        - PolicyName: portfolio-access-iam-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: GetEngineRole
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-AccountsEngineRole-*
+
+  PortfolioAccessFunction:
+    Condition: AutoAddPortfolioAccessEnabled
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - PortfolioAccessLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-portfolio-access
+      Runtime: python3.14
+      Handler: index.lambda_handler
+      Role: !GetAtt PortfolioAccessRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import threading
+          import time
+          import urllib.request
+          
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+          
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+          
+          CFG = Config(retries={"max_attempts": 10, "mode": "standard"})
+          
+          _RESPONDED = False
+          _LOCK = threading.Lock()
+          
+          
+          def _cfn_send(event, context, status: str, reason: str = "", data: dict | None = None, physical_id: str | None = None):
+              """Best-effort CloudFormation response with retries until near-timeout."""
+              global _RESPONDED
+          
+              resp_url = (event or {}).get("ResponseURL")
+              if not resp_url:
+                  return
+          
+              body = {
+                  "Status": status,
+                  "Reason": (reason or f"See CloudWatch Logs: {context.log_stream_name}")[:1024],
+                  "PhysicalResourceId": physical_id or event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event.get("StackId"),
+                  "RequestId": event.get("RequestId"),
+                  "LogicalResourceId": event.get("LogicalResourceId"),
+                  "NoEcho": False,
+                  "Data": data or {},
+              }
+              payload = json.dumps(body).encode("utf-8")
+          
+              with _LOCK:
+                  if _RESPONDED:
+                      return
+          
+                  deadline = time.time() + max((context.get_remaining_time_in_millis() / 1000.0) - 1.5, 1.0)
+                  attempt = 0
+                  last_err = None
+          
+                  while time.time() < deadline:
+                      attempt += 1
+                      try:
+                          req = urllib.request.Request(
+                              resp_url,
+                              data=payload,
+                              method="PUT",
+                              headers={"Content-Type": "", "Content-Length": str(len(payload))},
+                          )
+                          with urllib.request.urlopen(req, timeout=10) as r:
+                              r.read()
+          
+                          _RESPONDED = True
+                          return
+                      except Exception as e:
+                          last_err = e
+                          sleep_s = min(2 ** min(attempt, 5), 10)
+                          log.warning("CFN response attempt %d failed: %s (sleep %.1fs)", attempt, str(e), sleep_s)
+                          time.sleep(sleep_s)
+          
+                  log.error("CFN response could not be delivered before timeout window. Last error: %s", str(last_err))
+          
+          
+          def _first(props: dict, *keys: str) -> str:
+              for k in keys:
+                  v = props.get(k)
+                  if v is not None and str(v).strip():
+                      return str(v).strip()
+              return ""
+          
+          
+          def _lookup_product_id_for_account(sc, account_id: str) -> str | None:
+              resp = sc.search_provisioned_products(Filters={"SearchQuery": [f"physicalId:{account_id}"]})
+              pps = resp.get("ProvisionedProducts", []) or []
+              if not pps:
+                  return None
+              pps.sort(key=lambda x: x.get("CreatedTime") or 0, reverse=True)
+              return pps[0].get("ProductId")
+          
+          
+          def _portfolio_from_launch_paths(sc, product_id: str) -> str | None:
+              try:
+                  resp = sc.list_launch_paths(ProductId=product_id)
+                  summaries = resp.get("LaunchPathSummaries", []) or []
+                  if summaries:
+                      summaries.sort(key=lambda x: (x.get("PortfolioId") or ""))
+                      return summaries[0].get("PortfolioId")
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  log.warning("ListLaunchPaths failed for product %s: %s", product_id, code)
+              return None
+          
+          
+          def _portfolio_fallback_by_name(sc, name_contains: str) -> str | None:
+              token = None
+              target = (name_contains or "").lower()
+              while True:
+                  kwargs = {"PageSize": 20}
+                  if token:
+                      kwargs["PageToken"] = token
+                  resp = sc.list_portfolios(**kwargs)
+                  for p in (resp.get("PortfolioDetails", []) or []):
+                      dn = (p.get("DisplayName") or "")
+                      if target and target in dn.lower():
+                          return p.get("Id")
+                  token = resp.get("NextPageToken")
+                  if not token:
+                      return None
+          
+          
+          def lambda_handler(event, context):
+              global _RESPONDED
+              _RESPONDED = False
+          
+              req_type = (event.get("RequestType") or "").strip()
+              props = event.get("ResourceProperties") or {}
+          
+              principal_arn = _first(props, "PrincipalArn", "EngineRoleArn")
+              portfolio_id = _first(props, "PortfolioId")
+              target_account_id = _first(props, "TargetAccountId")
+              name_contains = _first(props, "PortfolioNameContains") or "account factory"
+          
+              physical_id = event.get("PhysicalResourceId") or context.log_stream_name
+          
+              def _timeout_fail():
+                  if not _RESPONDED:
+                      _cfn_send(event, context, "FAILED", "Timed out before sending CloudFormation response", physical_id=physical_id)
+          
+              timer = threading.Timer(max((context.get_remaining_time_in_millis() / 1000.0) - 2.0, 1.0), _timeout_fail)
+              timer.daemon = True
+              timer.start()
+          
+              sc = boto3.client("servicecatalog", config=CFG)
+          
+              try:
+                  if not principal_arn:
+                      raise Exception("Missing required property: PrincipalArn (or EngineRoleArn)")
+          
+                  if not portfolio_id and target_account_id:
+                      product_id = _lookup_product_id_for_account(sc, target_account_id)
+                      if product_id:
+                          portfolio_id = _portfolio_from_launch_paths(sc, product_id)
+          
+                  if not portfolio_id:
+                      portfolio_id = _portfolio_fallback_by_name(sc, name_contains)
+          
+                  if not portfolio_id:
+                      raise Exception("Unable to determine Account Factory portfolio id")
+          
+                  # Use a stable PhysicalResourceId so Delete can reverse the exact association.
+                  phys_id = f"{portfolio_id}|{principal_arn}"
+          
+                  if req_type in ("Create", "Update"):
+                      sc.associate_principal_with_portfolio(
+                          PortfolioId=portfolio_id,
+                          PrincipalARN=principal_arn,
+                          PrincipalType="IAM",
+                      )
+                      _cfn_send(event, context, "SUCCESS", "OK", data={"PortfolioId": portfolio_id, "PrincipalArn": principal_arn}, physical_id=phys_id)
+                      return
+          
+                  if req_type == "Delete":
+                      pid = portfolio_id
+                      parn = principal_arn
+                      prior = event.get("PhysicalResourceId") or ""
+                      if "|" in prior:
+                          pid, parn = prior.split("|", 1)
+          
+                      sc.disassociate_principal_from_portfolio(
+                          PortfolioId=pid,
+                          PrincipalARN=parn,
+                      )
+                      _cfn_send(event, context, "SUCCESS", "OK", data={"PortfolioId": pid, "PrincipalArn": parn}, physical_id=phys_id)
+                      return
+          
+                  raise Exception(f"Unsupported RequestType: {req_type}")
+              except ClientError as e:
+                  err = e.response.get("Error") or {}
+                  code = err.get("Code", "Unknown")
+                  msg = err.get("Message", "")
+                  _cfn_send(event, context, "FAILED", f"{code}: {msg}", physical_id=physical_id)
+              except Exception as e:
+                  log.exception("PortfolioAccessFunction failed")
+                  _cfn_send(event, context, "FAILED", str(e), physical_id=physical_id)
+              finally:
+                  try:
+                      timer.cancel()
+                  except Exception:
+                      pass
+  PortfolioAccessLogGroup:
+    Condition: AutoAddPortfolioAccessEnabled
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-portfolio-access
+      RetentionInDays: 365
+
+  AutoAddEngineRoleToAccountFactoryPortfolio:
+    Condition: AutoAddPortfolioAccessEnabled
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - AllowCloudFormationInvokePortfolioAccess
+    Properties:
+      ServiceToken: !GetAtt PortfolioAccessFunction.Arn
+      PrincipalArn: !GetAtt AccountsEngineRole.Arn
+      TargetAccountId: !Ref AutomationTargetAccountId
+      PortfolioNameContains: account factory
+
+Outputs:
+  EventRuleName:
+    Value: !Ref AccountsUpdateSucceededRule
+  EngineFunctionName:
+    Value: !Ref AccountsEngineFunction
+  CleanupFunctionName:
+    Value: !Ref AccountsTagsCleanupFunction

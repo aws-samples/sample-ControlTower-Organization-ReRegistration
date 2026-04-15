@@ -1,0 +1,1643 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Control Tower OU baseline reset automation. Targets only Control Tower-managed OUs,
+  skips the core OU discovered from the landing zone manifest, skips ROOT, supports nested OUs. for all details, please refer to https://github.com/aws-samples/sample-ControlTower-Organization-ReRegistration
+
+Parameters:
+  EnableEventRule:
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: Activate or deactivate the EventBridge rule that continues the automation lifecycle.
+  TagStartedKey:
+    Type: String
+    Default: ResetEnabledBaselineStart
+    Description: Tag key used to mark an OU as started.
+  TagCompletedKey:
+    Type: String
+    Default: ResetEnabledBaselineComplete
+    Description: Tag key used to mark an OU as completed.
+  AutoAddLambdaRoleToPortoflioAccess:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: "If true, Stack will automatically associate the OU engine Lambda role with the Account Factory portfolio before the OU reset automation starts. If false, the user must manually associate the role."
+  AutoUpdateBaseLine:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: "If true, the Lambda updates an incompatible OU baseline to the latest version compatible with the current landing zone before continuing. If false, incompatible OU baselines are skipped."
+  AutomationTargetOrganizationalUnitId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^ou-[a-z0-9]{4,32}-[a-z0-9]{8,32}$'
+    ConstraintDescription: Must be empty or a valid Organizations OU ID such as ou-ab12-12345678.
+    Description: >
+      If set, the stack triggers the Lambda function to reset the enabled baseline for that OU and tag it accordingly. This allows the lifecycle events to continue the automation. If not set user will have to re-register OU manually outside of the stack to trigger automation.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "ControlTower Organizational Units ReRegistration Automation"
+        Parameters:
+          - EnableEventRule
+          - TagStartedKey
+          - TagCompletedKey
+          - AutoAddLambdaRoleToPortoflioAccess
+          - AutoUpdateBaseLine
+      -
+        Label:
+          default: "Optional parameters"
+        Parameters:
+          - AutomationTargetOrganizationalUnitId
+    ParameterLabels:
+      EnableEventRule:
+        default: Activate Or Deactivate The EventBridge Rule
+      TagStartedKey:
+        default: Reset Operation Started Tag
+      TagCompletedKey:
+        default: Reset Operation Completed Tag
+      AutoAddLambdaRoleToPortoflioAccess:
+        default: Auto-associate Lambda role with Account Factory portfolio
+      AutoUpdateBaseLine:
+        default: Auto-update incompatible baseline
+      AutomationTargetOrganizationalUnitId:
+        default: Organizational Unit ID to reset first
+
+Conditions:
+  HasAutomationTargetOrganizationalUnitId: !Not
+    - !Equals
+      - !Ref AutomationTargetOrganizationalUnitId
+      - ''
+  AutoAddPortfolioAccessEnabled: !Equals [!Ref AutoAddLambdaRoleToPortoflioAccess, 'true']
+  AutoUpdateBaseLineEnabled: !Equals [!Ref AutoUpdateBaseLine, 'true']
+  HasTargetAndAutoAdd: !And [!Condition HasAutomationTargetOrganizationalUnitId, !Condition AutoAddPortfolioAccessEnabled]
+  HasTargetAndNoAutoAdd: !And [!Condition HasAutomationTargetOrganizationalUnitId, !Not [!Condition AutoAddPortfolioAccessEnabled]]
+
+Resources:
+  OUBaselineAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AWSServiceCatalogEndUserFullAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: OUBaselineAutomationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ServiceCatalogAccountFactoryUpdate
+                Effect: Allow
+                Action:
+                  - servicecatalog:SearchProducts
+                  - servicecatalog:SearchProvisionedProducts
+                  - servicecatalog:DescribeProduct
+                  - servicecatalog:DescribeProductView
+                  - servicecatalog:DescribeProvisionedProduct
+                  - servicecatalog:ListLaunchPaths
+                  - servicecatalog:ListProvisioningArtifacts
+                  - servicecatalog:ListRecordHistory
+                  - servicecatalog:DescribeProvisioningParameters
+                  - servicecatalog:DescribeRecord
+                  - servicecatalog:ProvisionProduct
+                  - servicecatalog:UpdateProvisionedProduct
+                  - servicecatalog:DeleteProvisioningArtifact
+                  - servicecatalog:UpdateProvisioningArtifact
+                  - servicecatalog:CreateProvisioningArtifact
+                Resource: "*"
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Sid: OrganizationsReadWrite
+                Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:DescribeOrganizationalUnit
+                  - organizations:ListRoots
+                  - organizations:ListOrganizationalUnitsForParent
+                  - organizations:ListAccountsForParent
+                  - organizations:ListParents
+                  - organizations:ListTagsForResource
+                  - organizations:TagResource
+                  - organizations:UntagResource
+                Resource: '*'
+              - Sid: OrganizationsPolicyManagementForControls
+                Effect: Allow
+                Action:
+                  - organizations:AttachPolicy
+                  - organizations:CreatePolicy
+                  - organizations:DeletePolicy
+                  - organizations:DetachPolicy
+                  - organizations:DescribePolicy
+                  - organizations:ListPolicies
+                  - organizations:ListPoliciesForTarget
+                  - organizations:ListTargetsForPolicy
+                  - organizations:UpdatePolicy
+                Resource: '*'
+              - Sid: ControlTowerReadWrite
+                Effect: Allow
+                Action:
+                  - controltower:GetLandingZone
+                  - controltower:GetEnabledBaseline
+                  - controltower:ListLandingZones
+                  - controltower:ListBaselines
+                  - controltower:ListEnabledBaselines
+                  - controltower:ResetEnabledBaseline
+                  - controltower:UpdateEnabledBaseline
+                Resource: '*'
+              - Sid: IdentityCenterRead
+                Effect: Allow
+                Action:
+                  - sso:ListInstances
+                  - sso:GetProfile
+                  - sso:CreateProfile
+                  - sso:UpdateProfile
+                  - sso:GetTrust
+                  - sso:CreateTrust
+                  - sso:UpdateTrust
+                  - sso:GetApplicationInstance
+                  - sso:CreateApplicationInstance
+                  - identitystore:GetUserId
+                  - identitystore:DescribeUser
+                  - sso:DescribeRegisteredRegions
+                  - sso:ListDirectoryAssociations
+                  - sso-directory:DescribeDirectory
+                  - sso:GetSSOStatus
+                  - cloudformation:GetTemplateSummary
+                  - sso-directory:SearchGroups
+                  - sso:ListPermissionSets
+                  - sso-directory:CreateUser
+                  - sso-directory:SearchUsers
+                  - sso:ListProfileAssociations
+                Resource: "*"
+
+  OUBaselineAutomationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-ou-baseline-automation
+      RetentionInDays: 30
+
+  OUBaselineAutomationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt OUBaselineAutomationRole.Arn
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 512
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref OUBaselineAutomationLogGroup
+      Environment:
+        Variables:
+          TAG_STARTED: !Ref TagStartedKey
+          TAG_COMPLETED: !Ref TagCompletedKey
+          AUTO_UPDATE_BASELINE: !Ref AutoUpdateBaseLine
+          AUTOMATION_TARGET_ORGANIZATIONAL_UNIT_ID: !Ref AutomationTargetOrganizationalUnitId
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import re
+          import traceback
+          import urllib.request
+
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+          TAG_STARTED = os.environ.get("TAG_STARTED", "ResetEnabledBaselineStart")
+          TAG_COMPLETED = os.environ.get("TAG_COMPLETED", "ResetEnabledBaselineComplete")
+          AUTO_UPDATE_BASELINE = (os.environ.get("AUTO_UPDATE_BASELINE", "false").strip().lower() == "true")
+          CT_HOME_REGION = os.environ.get("AWS_REGION")
+          TARGET_OU_ID = (os.environ.get("AUTOMATION_TARGET_ORGANIZATIONAL_UNIT_ID") or "").strip()
+
+          CFG = Config(
+              retries={"max_attempts": 10, "mode": "adaptive"},
+              connect_timeout=10,
+              read_timeout=120,
+          )
+
+          OU_ID_RE = re.compile(r"^ou-[a-z0-9]{4,32}-[a-z0-9]{8,32}$")
+          OU_ARN_RE = re.compile(r":ou/o-[a-z0-9]{10,32}/(ou-[a-z0-9]{4,32}-[a-z0-9]{8,32})$")
+
+          _CACHE = {
+              "mgmt": None,
+              "lz_core_accounts": None,
+              "landing_zone_identifier": None,
+              "landing_zone_version": None,
+              "aws_controltower_baseline_arn": None,
+              "identity_center_baseline_arn": None,
+              "identity_center_enabled_baseline_arn": None,
+              "enabled_baseline_parameters": {},
+              "core_ou_id": None,
+              "ou_meta": {},
+              "tag_keys": {},
+              "ordered_ou_ids": None,
+              "managed_ou_baselines": None,
+          }
+
+
+          def _ct_client():
+              return boto3.client("controltower", region_name=CT_HOME_REGION, config=CFG)
+
+
+          def _org_client():
+              return boto3.client("organizations", config=CFG)
+
+
+          def _now(event=None):
+              if isinstance(event, dict) and event.get("time"):
+                  return str(event["time"])
+              from datetime import datetime, timezone
+              return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+          def _respond_cfn(event, context, status, data=None, reason=None, physical_id=None):
+              if "ResponseURL" not in event:
+                  return
+
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch Logs: {getattr(context, 'log_stream_name', 'no-log-stream')}",
+                  "PhysicalResourceId": physical_id or getattr(context, "log_stream_name", "ou-baseline-automation"),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode("utf-8")
+
+              req = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=body,
+                  method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))},
+              )
+              with urllib.request.urlopen(req) as resp:
+                  log.info("Custom resource response status: %s", getattr(resp, "status", "unknown"))
+
+
+          def _management_account_id(org):
+              if _CACHE["mgmt"] is None:
+                  resp = org.describe_organization()
+                  _CACHE["mgmt"] = (resp.get("Organization") or {}).get("ManagementAccountId")
+              return _CACHE["mgmt"]
+
+
+          def _tag_keys(org, resource_id):
+              cached = _CACHE["tag_keys"].get(resource_id)
+              if cached is not None:
+                  return set(cached)
+
+              try:
+                  tags = (org.list_tags_for_resource(ResourceId=resource_id).get("Tags") or [])
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  if code in ("OrganizationalUnitNotFoundException", "AWSOrganizationsNotInUseException"):
+                      return set()
+                  raise
+
+              keys = {str(t.get("Key")).strip() for t in tags if t.get("Key")}
+              _CACHE["tag_keys"][resource_id] = set(keys)
+              return set(keys)
+
+
+          def _tag_resource(org, resource_id, key, value):
+              org.tag_resource(ResourceId=resource_id, Tags=[{"Key": key, "Value": str(value)[:256]}])
+              keys = _CACHE["tag_keys"].get(resource_id) or set()
+              keys = set(keys)
+              keys.add(key)
+              _CACHE["tag_keys"][resource_id] = keys
+
+
+          def _tag_ou_if_exists(org, ou_id, key, value):
+              try:
+                  org.describe_organizational_unit(OrganizationalUnitId=ou_id)
+                  _tag_resource(org, ou_id, key, value)
+                  log.info("Tagged OU %s with %s=%s", ou_id, key, value)
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  if code in ("OrganizationalUnitNotFoundException", "AWSOrganizationsNotInUseException"):
+                      log.warning("Skipping tag on missing OU %s (%s)", ou_id, code)
+                      return
+                  raise
+
+
+          def _get_landing_zone_identifier(ct):
+              cached = _CACHE.get("landing_zone_identifier")
+              if cached is not None:
+                  return cached
+              try:
+                  resp = ct.list_landing_zones()
+              except ClientError as e:
+                  log.warning("ListLandingZones failed: %s", (e.response.get("Error") or {}).get("Code", ""))
+                  _CACHE["landing_zone_identifier"] = None
+                  return None
+
+              lzs = resp.get("landingZones") or resp.get("LandingZones") or []
+              if not lzs:
+                  _CACHE["landing_zone_identifier"] = None
+                  return None
+
+              first = lzs[0]
+              ident = first if isinstance(first, str) else (first.get("arn") or first.get("Arn"))
+              _CACHE["landing_zone_identifier"] = ident
+              return ident
+
+
+          def _get_landing_zone_detail(ct):
+              lz_id = _get_landing_zone_identifier(ct)
+              if not lz_id:
+                  return {}
+              try:
+                  resp = ct.get_landing_zone(landingZoneIdentifier=lz_id)
+              except TypeError:
+                  resp = ct.get_landing_zone(LandingZoneIdentifier=lz_id)
+              except ClientError as e:
+                  log.warning("GetLandingZone failed: %s", (e.response.get("Error") or {}).get("Code", ""))
+                  return {}
+              return resp.get("landingZone") or resp.get("LandingZone") or {}
+
+
+          def _landing_zone_version(ct):
+              cached = _CACHE.get("landing_zone_version")
+              if cached is not None:
+                  return cached
+              lz = _get_landing_zone_detail(ct)
+              version = str((lz.get("version") or lz.get("Version") or "")).strip()
+              _CACHE["landing_zone_version"] = version or None
+              return _CACHE["landing_zone_version"]
+
+
+          def _core_accounts_from_landing_zone_manifest(ct):
+              cached = _CACHE.get("lz_core_accounts")
+              if cached is not None:
+                  return cached
+
+              core = set()
+              lz = _get_landing_zone_detail(ct)
+              manifest = lz.get("manifest") or lz.get("Manifest") or {}
+              if isinstance(manifest, str):
+                  try:
+                      manifest = json.loads(manifest)
+                  except Exception:
+                      manifest = {}
+
+              sec = manifest.get("securityRoles") or {}
+              clog = manifest.get("centralizedLogging") or {}
+
+              sec_id = (sec.get("accountId") or "").strip()
+              log_id = (clog.get("accountId") or "").strip()
+
+              if sec_id:
+                  core.add(sec_id)
+              if log_id:
+                  core.add(log_id)
+
+              log.info("Landing zone core accounts from manifest: %s", sorted(core) if core else "(none found)")
+              _CACHE["lz_core_accounts"] = core
+              return core
+
+
+          def _aws_controltower_baseline_arn(ct):
+              cached = _CACHE.get("aws_controltower_baseline_arn")
+              if cached is not None:
+                  return cached
+
+              token = None
+              found = None
+              while True:
+                  kwargs = {}
+                  if token:
+                      kwargs["nextToken"] = token
+                  resp = ct.list_baselines(**kwargs)
+                  for baseline in resp.get("baselines") or resp.get("Baselines") or []:
+                      name = (baseline.get("name") or baseline.get("Name") or "").strip()
+                      if name == "AWSControlTowerBaseline":
+                          found = baseline.get("arn") or baseline.get("Arn")
+                          break
+                  if found:
+                      break
+                  token = resp.get("nextToken") or resp.get("NextToken")
+                  if not token:
+                      break
+
+              _CACHE["aws_controltower_baseline_arn"] = found
+              return found
+
+
+          def _identity_center_baseline_arn(ct):
+              cached = _CACHE.get("identity_center_baseline_arn")
+              if cached is not None:
+                  return cached or None
+
+              token = None
+              found = None
+              while True:
+                  kwargs = {}
+                  if token:
+                      kwargs["nextToken"] = token
+                  resp = ct.list_baselines(**kwargs)
+                  for baseline in resp.get("baselines") or resp.get("Baselines") or []:
+                      name = (baseline.get("name") or baseline.get("Name") or "").strip()
+                      if name == "IdentityCenterBaseline":
+                          found = baseline.get("arn") or baseline.get("Arn")
+                          break
+                  if found:
+                      break
+                  token = resp.get("nextToken") or resp.get("NextToken")
+                  if not token:
+                      break
+
+              _CACHE["identity_center_baseline_arn"] = found or ""
+              return found
+
+
+          def _identity_center_enabled_baseline_arn(ct):
+              cached = _CACHE.get("identity_center_enabled_baseline_arn")
+              if cached is not None:
+                  return cached or None
+
+              baseline_arn = _identity_center_baseline_arn(ct)
+              if not baseline_arn:
+                  _CACHE["identity_center_enabled_baseline_arn"] = ""
+                  log.info("IdentityCenterBaseline definition was not found. Updating baseline without Identity Center parameter.")
+                  return None
+
+              token = None
+              candidates = []
+              while True:
+                  kwargs = {"filter": {"baselineIdentifiers": [baseline_arn]}}
+                  if token:
+                      kwargs["nextToken"] = token
+                  resp = ct.list_enabled_baselines(**kwargs)
+                  for summary in resp.get("enabledBaselines") or resp.get("EnabledBaselines") or []:
+                      if summary.get("parentIdentifier") or summary.get("ParentIdentifier"):
+                          continue
+                      candidates.append(summary)
+                  token = resp.get("nextToken") or resp.get("NextToken")
+                  if not token:
+                      break
+
+              if not candidates:
+                  _CACHE["identity_center_enabled_baseline_arn"] = ""
+                  log.info("IdentityCenterBaseline is not enabled for the landing zone. Updating baseline without Identity Center parameter.")
+                  return None
+
+              succeeded = [c for c in candidates if _baseline_status(c) == "SUCCEEDED"]
+              chosen = (succeeded[0] if succeeded else candidates[0]) or {}
+              arn = (chosen.get("arn") or chosen.get("Arn") or "").strip()
+              _CACHE["identity_center_enabled_baseline_arn"] = arn
+
+              if arn:
+                  log.info("IdentityCenterBaseline is enabled. Using enabled baseline ARN %s for UpdateEnabledBaseline.", arn)
+                  return arn
+
+              log.info("IdentityCenterBaseline candidates were found but no enabled baseline ARN was returned. Updating baseline without Identity Center parameter.")
+              return None
+
+
+          def _enabled_baseline_parameter_map(ct, enabled_baseline_identifier):
+              cache = _CACHE.get("enabled_baseline_parameters") or {}
+              if enabled_baseline_identifier in cache:
+                  return dict(cache[enabled_baseline_identifier])
+
+              try:
+                  resp = ct.get_enabled_baseline(enabledBaselineIdentifier=enabled_baseline_identifier)
+              except TypeError:
+                  resp = ct.get_enabled_baseline(EnabledBaselineIdentifier=enabled_baseline_identifier)
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  log.warning("GetEnabledBaseline failed for %s: %s", enabled_baseline_identifier, code)
+                  cache[enabled_baseline_identifier] = {}
+                  _CACHE["enabled_baseline_parameters"] = cache
+                  return {}
+
+              details = resp.get("enabledBaselineDetails") or resp.get("EnabledBaselineDetails") or {}
+              params = details.get("parameters") or details.get("Parameters") or []
+              out = {}
+              for p in params:
+                  key = (p.get("key") or p.get("Key") or "").strip()
+                  value = (p.get("value") or p.get("Value") or "").strip()
+                  if key and value:
+                      out[key] = value
+
+              cache[enabled_baseline_identifier] = dict(out)
+              _CACHE["enabled_baseline_parameters"] = cache
+              return dict(out)
+
+
+          def _update_parameters_for_summary(ct, summary):
+              enabled_id = _enabled_baseline_identifier(summary)
+              if not enabled_id:
+                  return []
+
+              current_params = _enabled_baseline_parameter_map(ct, enabled_id)
+              existing_ic_arn = (current_params.get("IdentityCenterEnabledBaselineArn") or "").strip()
+              if existing_ic_arn:
+                  log.info("Using existing IdentityCenterEnabledBaselineArn from enabled baseline %s", enabled_id)
+                  return [{"key": "IdentityCenterEnabledBaselineArn", "value": existing_ic_arn}]
+
+              identity_center_enabled_baseline_arn = _identity_center_enabled_baseline_arn(ct)
+              if identity_center_enabled_baseline_arn:
+                  return [{"key": "IdentityCenterEnabledBaselineArn", "value": identity_center_enabled_baseline_arn}]
+
+              return []
+
+
+          def _list_child_ous(org, parent_id):
+              paginator = org.get_paginator("list_organizational_units_for_parent")
+              children = []
+
+              for page in paginator.paginate(ParentId=parent_id):
+                  for ou in page.get("OrganizationalUnits", []) or []:
+                      item = {
+                          "Id": ou.get("Id") or "",
+                          "Name": ou.get("Name") or "",
+                          "Arn": ou.get("Arn") or "",
+                      }
+                      if item["Id"]:
+                          children.append(item)
+                          _CACHE["ou_meta"][item["Id"]] = dict(item)
+
+              return children
+
+
+          def _ordered_ou_ids(org):
+              cached = _CACHE.get("ordered_ou_ids")
+              if cached is not None:
+                  return list(cached)
+
+              roots = org.list_roots().get("Roots", []) or []
+              ordered = []
+              stack = []
+
+              # Build a true top-down pre-order traversal in Organizations service order:
+              # parent first, then its descendants, then the next sibling.
+              # This ensures children of a tagged/blocked parent are still evaluated before
+              # moving to the next top-level OU.
+              for root in reversed(roots):
+                  root_id = root.get("Id")
+                  if not root_id:
+                      continue
+                  children = _list_child_ous(org, root_id)
+                  for child in reversed(children):
+                      stack.append(child["Id"])
+
+              while stack:
+                  ou_id = stack.pop()
+                  ordered.append(ou_id)
+
+                  children = _list_child_ous(org, ou_id)
+                  for child in reversed(children):
+                      stack.append(child["Id"])
+
+              _CACHE["ordered_ou_ids"] = list(ordered)
+              log.info(
+                  "Built ordered OU list containing %d OUs in true top-down Organizations service order",
+                  len(ordered),
+              )
+              return list(ordered)
+
+
+          def _direct_account_ids_for_ou(org, ou_id):
+              out = set()
+              paginator = org.get_paginator("list_accounts_for_parent")
+              for page in paginator.paginate(ParentId=ou_id):
+                  for account in page.get("Accounts", []) or []:
+                      aid = (account.get("Id") or "").strip()
+                      if aid:
+                          out.add(aid)
+              return out
+
+
+          def _ou_meta(org, ou_id):
+              cached = _CACHE["ou_meta"].get(ou_id)
+              if cached is not None and cached.get("Id") and ("Name" in cached) and ("Arn" in cached):
+                  return dict(cached)
+
+              resp = org.describe_organizational_unit(OrganizationalUnitId=ou_id)
+              ou = resp.get("OrganizationalUnit") or {}
+              meta = {
+                  "Id": ou.get("Id") or ou_id,
+                  "Name": ou.get("Name") or "",
+                  "Arn": ou.get("Arn") or "",
+              }
+              _CACHE["ou_meta"][ou_id] = dict(meta)
+              return meta
+
+
+          def _core_ou_id(org, ct):
+              cached = _CACHE.get("core_ou_id")
+              if cached is not None:
+                  return cached
+
+              core_accounts = _core_accounts_from_landing_zone_manifest(ct)
+              mgmt = _management_account_id(org)
+              needle = {x for x in core_accounts if x and x != mgmt}
+
+              if not needle:
+                  _CACHE["core_ou_id"] = None
+                  return None
+
+              for ou_id in _ordered_ou_ids(org):
+                  accounts = _direct_account_ids_for_ou(org, ou_id)
+                  if needle.issubset(accounts):
+                      _CACHE["core_ou_id"] = ou_id
+                      log.info("Detected core OU %s from manifest accounts %s", ou_id, sorted(needle))
+                      return ou_id
+
+              _CACHE["core_ou_id"] = None
+              log.warning("Unable to identify core OU from manifest account IDs.")
+              return None
+
+
+          def _parse_ou_id(value):
+              if not value:
+                  return None
+              value = str(value).strip()
+              if OU_ID_RE.match(value):
+                  return value
+              m = OU_ARN_RE.search(value)
+              if m:
+                  return m.group(1)
+              return None
+
+
+          def _managed_ou_baselines(ct):
+              cached = _CACHE.get("managed_ou_baselines")
+              if cached is not None:
+                  return cached
+
+              inventory = {}
+              token = None
+
+              while True:
+                  kwargs = {}
+                  if token:
+                      kwargs["nextToken"] = token
+                  resp = ct.list_enabled_baselines(**kwargs)
+                  for summary in resp.get("enabledBaselines") or resp.get("EnabledBaselines") or []:
+                      target = (summary.get("targetIdentifier") or summary.get("TargetIdentifier") or "")
+                      ou_id = _parse_ou_id(target)
+                      if not ou_id:
+                          continue
+                      inventory.setdefault(ou_id, []).append(summary)
+                  token = resp.get("nextToken") or resp.get("NextToken")
+                  if not token:
+                      break
+
+              _CACHE["managed_ou_baselines"] = inventory
+              log.info("Built managed OU baseline inventory for %d OUs", len(inventory))
+              return inventory
+
+
+          def _baseline_status(summary):
+              status = (
+                  ((summary.get("statusSummary") or {}).get("status"))
+                  or ((summary.get("StatusSummary") or {}).get("Status"))
+                  or summary.get("status")
+                  or summary.get("Status")
+                  or ""
+              )
+              return str(status).upper()
+
+
+          def _enabled_baseline_identifier(summary):
+              return summary.get("arn") or summary.get("Arn") or ""
+
+
+          def _enabled_baseline_version(summary):
+              return str(summary.get("baselineVersion") or summary.get("BaselineVersion") or "").strip()
+
+
+          def _baseline_identifier(summary):
+              return str(summary.get("baselineIdentifier") or summary.get("BaselineIdentifier") or "").strip()
+
+
+          def _operation_identifier(resp):
+              return resp.get("operationIdentifier") or resp.get("OperationIdentifier") or ""
+
+
+          def _version_tuple(v):
+              return tuple(int(x) for x in str(v or "").strip().split(".") if x != "")
+
+
+          def _version_in_range(v, start, end):
+              tv = _version_tuple(v)
+              return _version_tuple(start) <= tv <= _version_tuple(end)
+
+
+          def _baseline_compatibility_for_lz(lz_version):
+              if not lz_version:
+                  return None
+              if _version_in_range(lz_version, "2.0", "2.7"):
+                  return {"latest": "1.0", "compatible": {"1.0"}}
+              if _version_in_range(lz_version, "2.8", "2.9"):
+                  return {"latest": "2.0", "compatible": {"1.0", "2.0"}}
+              if _version_in_range(lz_version, "3.0", "3.1"):
+                  return {"latest": "3.0", "compatible": {"3.0"}}
+              if _version_in_range(lz_version, "3.2", "3.3"):
+                  return {"latest": "4.0", "compatible": {"3.0", "4.0"}}
+              if _version_tuple(lz_version) == _version_tuple("4.0"):
+                  return {"latest": "5.0", "compatible": {"5.0"}}
+              return None
+
+
+          def _is_root_ou(org, ou_id):
+              return any((r.get("Id") or "") == ou_id for r in (org.list_roots().get("Roots") or []))
+
+
+          def _is_aws_controltower_baseline(ct, summary):
+              baseline_id = _baseline_identifier(summary)
+              ctb = _aws_controltower_baseline_arn(ct)
+              if ctb:
+                  return baseline_id == ctb
+              return "AWSControlTowerBaseline" in baseline_id
+
+
+          def _baseline_plan_for_summary(ct, summary):
+              enabled_id = _enabled_baseline_identifier(summary)
+              if not enabled_id:
+                  return {"action": "skip", "reason": "missing-enabled-baseline-identifier"}
+
+              if not _is_aws_controltower_baseline(ct, summary):
+                  return {"action": "reset", "enabledBaselineIdentifier": enabled_id}
+
+              current_version = _enabled_baseline_version(summary)
+              normalized_current_version = ".".join(str(x) for x in _version_tuple(current_version)) if _version_tuple(current_version) else ""
+              lz_version = _landing_zone_version(ct)
+              compat = _baseline_compatibility_for_lz(lz_version)
+
+              if not compat:
+                  return {
+                      "action": "skip",
+                      "reason": "unknown-landing-zone-version",
+                      "enabledBaselineIdentifier": enabled_id,
+                      "landingZoneVersion": lz_version,
+                      "currentBaselineVersion": current_version,
+                  }
+
+              compatible_versions = {".".join(str(x) for x in _version_tuple(v)) for v in compat["compatible"]}
+              target_baseline_version = ".".join(str(x) for x in _version_tuple(compat["latest"]))
+
+              if normalized_current_version in compatible_versions:
+                  return {
+                      "action": "reset",
+                      "enabledBaselineIdentifier": enabled_id,
+                      "landingZoneVersion": lz_version,
+                      "currentBaselineVersion": current_version,
+                  }
+
+              if not AUTO_UPDATE_BASELINE:
+                  return {
+                      "action": "skip",
+                      "reason": "incompatible-baseline-auto-update-disabled",
+                      "enabledBaselineIdentifier": enabled_id,
+                      "landingZoneVersion": lz_version,
+                      "currentBaselineVersion": current_version,
+                      "targetBaselineVersion": target_baseline_version,
+                  }
+
+              plan = {
+                  "action": "update",
+                  "enabledBaselineIdentifier": enabled_id,
+                  "landingZoneVersion": lz_version,
+                  "currentBaselineVersion": current_version,
+                  "targetBaselineVersion": target_baseline_version,
+              }
+              parameters = _update_parameters_for_summary(ct, summary)
+              if parameters:
+                  plan["parameters"] = parameters
+              return plan
+
+
+          def _is_control_tower_managed_ou(ct, ou_id):
+              enabled = list((_managed_ou_baselines(ct)).get(ou_id) or [])
+              if not enabled:
+                  return False, [], "no-enabled-baselines"
+
+              statuses = [_baseline_status(e) for e in enabled]
+              if any(s in ("UNDER_CHANGE", "PLAN_IN_PROGRESS") for s in statuses):
+                  return False, enabled, "under-change"
+
+              return True, enabled, "managed"
+
+
+          def _mark_ou_under_change_in_cache(ou_id, new_baseline_version=None):
+              inventory = _CACHE.get("managed_ou_baselines") or {}
+              if ou_id not in inventory:
+                  return
+
+              for summary in inventory.get(ou_id) or []:
+                  if summary.get("statusSummary") is not None:
+                      summary.setdefault("statusSummary", {})["status"] = "UNDER_CHANGE"
+                  elif summary.get("StatusSummary") is not None:
+                      summary.setdefault("StatusSummary", {})["Status"] = "UNDER_CHANGE"
+                  else:
+                      summary["status"] = "UNDER_CHANGE"
+
+                  if new_baseline_version and _is_aws_controltower_baseline(_ct_client(), summary):
+                      summary["baselineVersion"] = new_baseline_version
+
+
+          def _start_reset_for_ou(org, ct, ou_id, event_time, manual=False):
+              if not OU_ID_RE.match(ou_id or ""):
+                  return {"status": "invalid-ou-id", "ou_id": ou_id}
+
+              if _is_root_ou(org, ou_id):
+                  return {"status": "skip-root", "ou_id": ou_id}
+
+              core_ou = _core_ou_id(org, ct)
+              if core_ou and ou_id == core_ou:
+                  return {"status": "skip-core-ou", "ou_id": ou_id}
+
+              managed, enabled, reason = _is_control_tower_managed_ou(ct, ou_id)
+              if not managed:
+                  return {"status": f"skip-{reason}", "ou_id": ou_id}
+
+              plans = []
+              blocking_skip = None
+              for summary in enabled:
+                  plan = _baseline_plan_for_summary(ct, summary)
+                  if plan.get("action") == "skip":
+                      if plan.get("reason") in ("incompatible-baseline-auto-update-disabled", "unknown-landing-zone-version"):
+                          blocking_skip = plan
+                          break
+                      continue
+                  plans.append(plan)
+
+              if blocking_skip:
+                  result = {"status": f"skip-{blocking_skip.get('reason')}", "ou_id": ou_id}
+                  for k, v in blocking_skip.items():
+                      if k not in ("action", "reason"):
+                          result[k] = v
+                  log.warning("Skipping OU %s because baseline action is blocked: %s", ou_id, result)
+                  return result
+
+              if not plans:
+                  return {"status": "skip-no-resettable-baselines", "ou_id": ou_id}
+
+              started_value = ("manual-" if manual else "") + event_time
+              try:
+                  _tag_ou_if_exists(org, ou_id, TAG_STARTED, started_value)
+              except Exception as e:
+                  return {"status": "tag-start-failed", "ou_id": ou_id, "error": str(e)}
+
+              ops = []
+              planned_update_version = None
+
+              for plan in plans:
+                  enabled_id = plan["enabledBaselineIdentifier"]
+                  if plan["action"] == "update":
+                      update_kwargs = {
+                          "enabledBaselineIdentifier": enabled_id,
+                          "baselineVersion": plan["targetBaselineVersion"],
+                      }
+                      if plan.get("parameters"):
+                          update_kwargs["parameters"] = plan["parameters"]
+                      resp = ct.update_enabled_baseline(**update_kwargs)
+                      op_id = _operation_identifier(resp)
+                      planned_update_version = plan["targetBaselineVersion"]
+                      op = {
+                          "action": "update",
+                          "enabledBaselineIdentifier": enabled_id,
+                          "baselineVersion": plan["targetBaselineVersion"],
+                          "operationIdentifier": op_id,
+                      }
+                      if plan.get("parameters"):
+                          op["parameters"] = plan["parameters"]
+                      ops.append(op)
+                  else:
+                      resp = ct.reset_enabled_baseline(enabledBaselineIdentifier=enabled_id)
+                      op_id = _operation_identifier(resp)
+                      ops.append({
+                          "action": "reset",
+                          "enabledBaselineIdentifier": enabled_id,
+                          "operationIdentifier": op_id,
+                      })
+
+              _mark_ou_under_change_in_cache(ou_id, new_baseline_version=planned_update_version)
+              log.info("Started baseline action for OU %s. Ops: %s", ou_id, ops)
+              return {"status": "started", "ou_id": ou_id, "operations": ops}
+
+
+          def _extract_completion(event):
+              detail = event.get("detail") or {}
+              event_name = detail.get("eventName") or ""
+              service = detail.get("serviceEventDetails") or {}
+
+              state = ""
+              ou_id = None
+              completed = event.get("time") or _now(event)
+
+              if event_name == "RegisterOrganizationalUnit":
+                  status = service.get("registerOrganizationalUnitStatus") or {}
+                  state = str(status.get("state") or "").upper()
+                  completed = status.get("completedTimestamp") or completed
+                  ou_id = (
+                      _parse_ou_id(status.get("organizationalUnitId"))
+                      or _parse_ou_id((status.get("organizationalUnit") or {}).get("organizationalUnitId"))
+                      or _parse_ou_id((detail.get("requestParameters") or {}).get("organizationalUnitId"))
+                  )
+
+              return event_name, ou_id, state, completed
+
+
+          def _next_candidate_ou(org, ct):
+              ordered = _ordered_ou_ids(org)
+              core_ou = _core_ou_id(org, ct)
+              total = len(ordered)
+
+              for index, ou_id in enumerate(ordered, start=1):
+                  if core_ou and ou_id == core_ou:
+                      continue
+
+                  tag_keys = _tag_keys(org, ou_id)
+                  if TAG_STARTED in tag_keys or TAG_COMPLETED in tag_keys:
+                      continue
+
+                  managed, enabled, reason = _is_control_tower_managed_ou(ct, ou_id)
+                  if not managed:
+                      if reason == "under-change":
+                          log.info("Skipping OU %s at position %d/%d because it is already under change", ou_id, index, total)
+                      continue
+
+                  blocked = False
+                  for summary in enabled:
+                      plan = _baseline_plan_for_summary(ct, summary)
+                      if plan.get("action") == "skip" and plan.get("reason") in ("incompatible-baseline-auto-update-disabled", "unknown-landing-zone-version"):
+                          blocked = True
+                          log.warning("Skipping OU %s at position %d/%d because baseline action is blocked: %s", ou_id, index, total, plan.get("reason"))
+                          break
+                  if blocked:
+                      continue
+
+                  meta = _ou_meta(org, ou_id)
+                  log.info(
+                      "Selected next eligible OU %s (%s) at position %d/%d in top-down Organizations service order",
+                      ou_id,
+                      meta.get("Name") or "",
+                      index,
+                      total,
+                  )
+                  return ou_id
+
+              log.info("No eligible OU found after scanning %d OUs", total)
+              return None
+
+
+          def _handle_custom_resource(event, context):
+              request_type = event.get("RequestType")
+              props = event.get("ResourceProperties") or {}
+              old_props = event.get("OldResourceProperties") or {}
+
+              target_ou_id = (props.get("AutomationTargetOrganizationalUnitId") or TARGET_OU_ID or "").strip()
+              old_target_ou_id = (old_props.get("AutomationTargetOrganizationalUnitId") or "").strip()
+
+              if request_type == "Delete":
+                  _respond_cfn(event, context, "SUCCESS", {"status": "delete-noop"})
+                  return {"status": "delete-noop"}
+
+              if request_type not in ("Create", "Update"):
+                  _respond_cfn(event, context, "SUCCESS", {"status": "unsupported-request-noop", "requestType": request_type})
+                  return {"status": "unsupported-request-noop", "requestType": request_type}
+
+              if not target_ou_id:
+                  _respond_cfn(event, context, "SUCCESS", {"status": "no-target-configured"})
+                  return {"status": "no-target-configured"}
+
+              if request_type == "Update" and target_ou_id == old_target_ou_id:
+                  _respond_cfn(event, context, "SUCCESS", {"status": "unchanged-target-noop", "ou_id": target_ou_id})
+                  return {"status": "unchanged-target-noop", "ou_id": target_ou_id}
+
+              org = _org_client()
+              ct = _ct_client()
+              result = _start_reset_for_ou(org, ct, target_ou_id, _now(event), manual=True)
+              _respond_cfn(event, context, "SUCCESS", result, physical_id=f"ou-baseline-kickoff-{target_ou_id or 'none'}")
+              return result
+
+
+          def _handle_eventbridge(event):
+              org = _org_client()
+              ct = _ct_client()
+
+              event_name, completed_ou, state, completed_ts = _extract_completion(event)
+              if event_name != "RegisterOrganizationalUnit":
+                  return {"status": "ignored-event", "eventName": event_name}
+
+              if state and state not in ("SUCCEEDED", "SUCCESS"):
+                  return {"status": "ignored-non-success", "eventName": event_name, "state": state}
+
+              if completed_ou:
+                  _tag_ou_if_exists(org, completed_ou, TAG_COMPLETED, completed_ts)
+
+              next_ou = _next_candidate_ou(org, ct)
+              if not next_ou:
+                  return {"status": "done-no-eligible-ou", "completedOu": completed_ou, "eventName": event_name}
+
+              result = _start_reset_for_ou(org, ct, next_ou, _now(event), manual=False)
+              result["completedOu"] = completed_ou
+              result["eventName"] = event_name
+              return result
+
+
+          def lambda_handler(event, context):
+              log.info("Received event: %s", json.dumps(event))
+              try:
+                  if "RequestType" in event and "ResponseURL" in event:
+                      return _handle_custom_resource(event, context)
+                  return _handle_eventbridge(event)
+              except Exception as e:
+                  log.error("Unhandled exception: %s", e)
+                  log.error(traceback.format_exc())
+                  if "RequestType" in event and "ResponseURL" in event:
+                      _respond_cfn(
+                          event,
+                          context,
+                          "FAILED",
+                          {"error": str(e)},
+                          reason=f"{type(e).__name__}: {e}",
+                      )
+                  raise
+
+  AllowCloudFormationInvokeStarter:
+    Condition: HasAutomationTargetOrganizationalUnitId
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OUBaselineAutomationFunction
+      Principal: cloudformation.amazonaws.com
+      SourceArn: !Ref AWS::StackId
+
+  AllowCloudFormationInvokePortfolioAccess:
+    Condition: AutoAddPortfolioAccessEnabled
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PortfolioAccessFunction
+      Principal: cloudformation.amazonaws.com
+      SourceArn: !Ref AWS::StackId
+
+  StartAutomationCustomResourceWithPortfolioAccess:
+    Condition: HasTargetAndAutoAdd
+    Type: Custom::KickoffOUBaselineReset
+    DependsOn:
+      - AutoAddOUEngineRoleToAccountFactoryPortfolio
+      - AllowCloudFormationInvokeStarter
+      - RegisterOrganizationalUnitRule
+    Properties:
+      ServiceToken: !GetAtt OUBaselineAutomationFunction.Arn
+      AutomationTargetOrganizationalUnitId: !Ref AutomationTargetOrganizationalUnitId
+
+  StartAutomationCustomResource:
+    Condition: HasTargetAndNoAutoAdd
+    Type: Custom::KickoffOUBaselineReset
+    DependsOn:
+      - AllowCloudFormationInvokeStarter
+      - RegisterOrganizationalUnitRule
+    Properties:
+      ServiceToken: !GetAtt OUBaselineAutomationFunction.Arn
+      AutomationTargetOrganizationalUnitId: !Ref AutomationTargetOrganizationalUnitId
+
+  RegisterOrganizationalUnitRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Invokes the OU baseline automation on successful Control Tower OU registration events.
+      EventPattern:
+        source:
+          - aws.controltower
+        detail-type:
+          - AWS Service Event via CloudTrail
+        detail:
+          eventSource:
+            - controltower.amazonaws.com
+          eventName:
+            - RegisterOrganizationalUnit
+      State: !Ref EnableEventRule
+      Targets:
+        - Arn: !GetAtt OUBaselineAutomationFunction.Arn
+          Id: OUBaselineAutomationFunctionRegisterTarget
+
+  PermissionForRegisterRuleToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OUBaselineAutomationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RegisterOrganizationalUnitRule.Arn
+
+
+  PortfolioAccessRole:
+    Condition: AutoAddPortfolioAccessEnabled
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: portfolio-access-logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-portfolio-access:*
+        - PolicyName: portfolio-access-servicecatalog
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListAndAssociate
+                Effect: Allow
+                Action:
+                  - servicecatalog:ListPortfolios
+                  - servicecatalog:SearchProvisionedProducts
+                  - servicecatalog:DescribeProvisionedProduct
+                  - servicecatalog:ListLaunchPaths
+                  - servicecatalog:ListPrincipalsForPortfolio
+                  - servicecatalog:AssociatePrincipalWithPortfolio
+                  - servicecatalog:DisassociatePrincipalFromPortfolio
+                Resource: "*"
+        - PolicyName: portfolio-access-iam-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: GetEngineRole
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-OUBaselineAutomationRole-*
+
+  PortfolioAccessLogGroup:
+    Condition: AutoAddPortfolioAccessEnabled
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-portfolio-access
+      RetentionInDays: 30
+
+  PortfolioAccessFunction:
+    Condition: AutoAddPortfolioAccessEnabled
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-portfolio-access
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt PortfolioAccessRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref PortfolioAccessLogGroup
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import threading
+          import time
+          import urllib.request
+
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+          CFG = Config(retries={"max_attempts": 10, "mode": "standard"})
+
+          _RESPONDED = False
+          _LOCK = threading.Lock()
+
+
+          def _cfn_send(event, context, status: str, reason: str = "", data: dict | None = None, physical_id: str | None = None):
+              global _RESPONDED
+
+              resp_url = (event or {}).get("ResponseURL")
+              if not resp_url:
+                  return
+
+              body = {
+                  "Status": status,
+                  "Reason": (reason or f"See CloudWatch Logs: {context.log_stream_name}")[:1024],
+                  "PhysicalResourceId": physical_id or event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event.get("StackId"),
+                  "RequestId": event.get("RequestId"),
+                  "LogicalResourceId": event.get("LogicalResourceId"),
+                  "NoEcho": False,
+                  "Data": data or {},
+              }
+              payload = json.dumps(body).encode("utf-8")
+
+              with _LOCK:
+                  if _RESPONDED:
+                      return
+
+                  deadline = time.time() + max((context.get_remaining_time_in_millis() / 1000.0) - 1.5, 1.0)
+                  attempt = 0
+                  last_err = None
+
+                  while time.time() < deadline:
+                      attempt += 1
+                      try:
+                          req = urllib.request.Request(
+                              resp_url,
+                              data=payload,
+                              method="PUT",
+                              headers={"Content-Type": "", "Content-Length": str(len(payload))},
+                          )
+                          with urllib.request.urlopen(req, timeout=10) as r:
+                              r.read()
+
+                          _RESPONDED = True
+                          return
+                      except Exception as e:
+                          last_err = e
+                          sleep_s = min(2 ** min(attempt, 5), 10)
+                          log.warning("CFN response attempt %d failed: %s (sleep %.1fs)", attempt, str(e), sleep_s)
+                          time.sleep(sleep_s)
+
+                  log.error("CFN response could not be delivered before timeout window. Last error: %s", str(last_err))
+
+
+          def _first(props: dict, *keys: str) -> str:
+              for k in keys:
+                  v = props.get(k)
+                  if v is not None and str(v).strip():
+                      return str(v).strip()
+              return ""
+
+
+          def _lookup_product_id_for_target(sc, account_id: str) -> str | None:
+              if not account_id:
+                  return None
+              resp = sc.search_provisioned_products(Filters={"SearchQuery": [f"physicalId:{account_id}"]})
+              pps = resp.get("ProvisionedProducts", []) or []
+              if not pps:
+                  return None
+              pps.sort(key=lambda x: x.get("CreatedTime") or 0, reverse=True)
+              return pps[0].get("ProductId")
+
+
+          def _portfolio_from_launch_paths(sc, product_id: str) -> str | None:
+              try:
+                  resp = sc.list_launch_paths(ProductId=product_id)
+                  summaries = resp.get("LaunchPathSummaries", []) or []
+                  if summaries:
+                      summaries.sort(key=lambda x: (x.get("PortfolioId") or ""))
+                      return summaries[0].get("PortfolioId")
+              except ClientError as e:
+                  code = (e.response.get("Error") or {}).get("Code", "")
+                  log.warning("ListLaunchPaths failed for product %s: %s", product_id, code)
+              return None
+
+
+          def _portfolio_fallback_by_name(sc, name_contains: str) -> str | None:
+              token = None
+              target = (name_contains or "").strip().lower()
+              contains_matches = []
+
+              while True:
+                  kwargs = {"PageSize": 20}
+                  if token:
+                      kwargs["PageToken"] = token
+                  resp = sc.list_portfolios(**kwargs)
+                  for p in (resp.get("PortfolioDetails", []) or []):
+                      dn = (p.get("DisplayName") or "").strip()
+                      dnl = dn.lower()
+                      if target and dnl == target:
+                          return p.get("Id")
+                      if target and target in dnl:
+                          contains_matches.append((dn, p.get("Id")))
+                  token = resp.get("NextPageToken")
+                  if not token:
+                      break
+
+              if len(contains_matches) == 1:
+                  return contains_matches[0][1]
+
+              if contains_matches:
+                  contains_matches.sort(key=lambda x: x[0])
+                  log.warning("Multiple portfolio name matches found for %s: %s", name_contains, [x[0] for x in contains_matches])
+                  return contains_matches[0][1]
+
+              return None
+
+
+          def _principal_visible_for_portfolio(sc, portfolio_id: str, principal_arn: str) -> bool:
+              token = None
+              while True:
+                  kwargs = {"PortfolioId": portfolio_id, "PageSize": 20}
+                  if token:
+                      kwargs["PageToken"] = token
+                  resp = sc.list_principals_for_portfolio(**kwargs)
+                  for pr in (resp.get("Principals", []) or []):
+                      if (pr.get("PrincipalARN") or "").strip() == principal_arn:
+                          return True
+                  token = resp.get("NextPageToken")
+                  if not token:
+                      return False
+
+
+          def _wait_for_principal_association(sc, portfolio_id: str, principal_arn: str, timeout_seconds: int = 90):
+              deadline = time.time() + timeout_seconds
+              while time.time() < deadline:
+                  if _principal_visible_for_portfolio(sc, portfolio_id, principal_arn):
+                      return True
+                  time.sleep(3)
+              return False
+
+
+          def lambda_handler(event, context):
+              global _RESPONDED
+              _RESPONDED = False
+
+              req_type = (event.get("RequestType") or "").strip()
+              props = event.get("ResourceProperties") or {}
+
+              principal_arn = _first(props, "PrincipalArn", "EngineRoleArn")
+              portfolio_id = _first(props, "PortfolioId")
+              target_account_id = _first(props, "TargetAccountId")
+              name_contains = _first(props, "PortfolioNameContains") or "AWS Control Tower Account Factory Portfolio"
+
+              physical_id = event.get("PhysicalResourceId") or context.log_stream_name
+
+              def _timeout_fail():
+                  if not _RESPONDED:
+                      _cfn_send(event, context, "FAILED", "Timed out before sending CloudFormation response", physical_id=physical_id)
+
+              timer = threading.Timer(max((context.get_remaining_time_in_millis() / 1000.0) - 2.0, 1.0), _timeout_fail)
+              timer.daemon = True
+              timer.start()
+
+              sc = boto3.client("servicecatalog", config=CFG)
+
+              try:
+                  if not principal_arn:
+                      raise Exception("Missing required property: PrincipalArn (or EngineRoleArn)")
+
+                  if not portfolio_id and target_account_id:
+                      product_id = _lookup_product_id_for_target(sc, target_account_id)
+                      if product_id:
+                          portfolio_id = _portfolio_from_launch_paths(sc, product_id)
+
+                  if not portfolio_id:
+                      portfolio_id = _portfolio_fallback_by_name(sc, name_contains)
+
+                  if not portfolio_id:
+                      raise Exception("Unable to determine Account Factory portfolio id")
+
+                  phys_id = f"{portfolio_id}|{principal_arn}"
+
+                  if req_type in ("Create", "Update"):
+                      try:
+                          sc.associate_principal_with_portfolio(
+                              PortfolioId=portfolio_id,
+                              PrincipalARN=principal_arn,
+                              PrincipalType="IAM",
+                          )
+                      except ClientError as e:
+                          code = (e.response.get("Error") or {}).get("Code", "")
+                          if code not in ("DuplicateResourceException", "ResourceInUseException"):
+                              raise
+
+                      if not _wait_for_principal_association(sc, portfolio_id, principal_arn, timeout_seconds=90):
+                          raise Exception(f"Principal {principal_arn} did not become visible on portfolio {portfolio_id} before timeout")
+
+                      _cfn_send(event, context, "SUCCESS", "OK", data={"PortfolioId": portfolio_id, "PrincipalArn": principal_arn}, physical_id=phys_id)
+                      return
+
+                  if req_type == "Delete":
+                      pid = portfolio_id
+                      parn = principal_arn
+                      prior = event.get("PhysicalResourceId") or ""
+                      if "|" in prior:
+                          pid, parn = prior.split("|", 1)
+
+                      try:
+                          sc.disassociate_principal_from_portfolio(
+                              PortfolioId=pid,
+                              PrincipalARN=parn,
+                          )
+                      except ClientError as e:
+                          code = (e.response.get("Error") or {}).get("Code", "")
+                          if code not in ("ResourceNotFoundException", "ResourceInUseException", "InvalidParametersException"):
+                              raise
+                      _cfn_send(event, context, "SUCCESS", "OK", data={"PortfolioId": pid, "PrincipalArn": parn}, physical_id=phys_id)
+                      return
+
+                  raise Exception(f"Unsupported RequestType: {req_type}")
+              except ClientError as e:
+                  err = e.response.get("Error") or {}
+                  code = err.get("Code", "Unknown")
+                  msg = err.get("Message", "")
+                  _cfn_send(event, context, "FAILED", f"{code}: {msg}", physical_id=physical_id)
+              except Exception as e:
+                  log.exception("PortfolioAccessFunction failed")
+                  _cfn_send(event, context, "FAILED", str(e), physical_id=physical_id)
+              finally:
+                  try:
+                      timer.cancel()
+                  except Exception:
+                      pass
+
+  AutoAddOUEngineRoleToAccountFactoryPortfolio:
+    Condition: AutoAddPortfolioAccessEnabled
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - AllowCloudFormationInvokePortfolioAccess
+    Properties:
+      ServiceToken: !GetAtt PortfolioAccessFunction.Arn
+      PrincipalArn: !GetAtt OUBaselineAutomationRole.Arn
+      PortfolioNameContains: AWS Control Tower Account Factory Portfolio
+
+  OrganizationalUnitsTagsCleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: OrganizationalUnitsTagsCleanupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Sid: OrganizationsCleanup
+                Effect: Allow
+                Action:
+                  - organizations:ListRoots
+                  - organizations:ListOrganizationalUnitsForParent
+                  - organizations:DescribeOrganizationalUnit
+                  - organizations:UntagResource
+                Resource: '*'
+
+  OrganizationalUnitsTagsCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-organizational-units-tags-cleanup
+      RetentionInDays: 30
+
+  OrganizationalUnitsTagsCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Role: !GetAtt OrganizationalUnitsTagsCleanupRole.Arn
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 512
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref OrganizationalUnitsTagsCleanupLogGroup
+      Environment:
+        Variables:
+          TAG_STARTED: !Ref TagStartedKey
+          TAG_COMPLETED: !Ref TagCompletedKey
+      Code:
+        ZipFile: |
+          import logging
+          import os
+
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          log = logging.getLogger()
+          log.setLevel(logging.INFO)
+
+          TAG_STARTED = os.environ.get("TAG_STARTED", "ResetEnabledBaselineStart")
+          TAG_COMPLETED = os.environ.get("TAG_COMPLETED", "ResetEnabledBaselineComplete")
+
+          CFG = Config(
+              retries={"max_attempts": 10, "mode": "adaptive"},
+              connect_timeout=10,
+              read_timeout=120,
+          )
+
+          def _org_client():
+              return boto3.client("organizations", config=CFG)
+
+          def _iter_ou_ids(org):
+              roots = org.list_roots().get("Roots", []) or []
+              paginator = org.get_paginator("list_organizational_units_for_parent")
+
+              def walk(parent_id):
+                  for page in paginator.paginate(ParentId=parent_id):
+                      for ou in page.get("OrganizationalUnits", []) or []:
+                          yield ou["Id"]
+                          for child in walk(ou["Id"]):
+                              yield child
+
+              for root in roots:
+                  for ou_id in walk(root["Id"]):
+                      yield ou_id
+
+          def lambda_handler(event, context):
+              org = _org_client()
+              processed = 0
+              cleaned = 0
+              errors = []
+
+              for ou_id in _iter_ou_ids(org):
+                  processed += 1
+                  try:
+                      org.untag_resource(
+                          ResourceId=ou_id,
+                          TagKeys=[TAG_STARTED, TAG_COMPLETED],
+                      )
+                      cleaned += 1
+                      log.info("Removed automation tags from OU %s", ou_id)
+                  except ClientError as e:
+                      code = (e.response.get("Error") or {}).get("Code", "")
+                      if code in ("OrganizationalUnitNotFoundException", "AWSOrganizationsNotInUseException"):
+                          log.warning("Skipping OU %s because it is not available: %s", ou_id, code)
+                          continue
+                      errors.append({"ou_id": ou_id, "error": str(e)})
+                      log.exception("Failed to remove automation tags from OU %s", ou_id)
+
+              return {
+                  "status": "completed",
+                  "processed_ou_count": processed,
+                  "cleanup_attempt_count": cleaned,
+                  "tag_keys": [TAG_STARTED, TAG_COMPLETED],
+                  "error_count": len(errors),
+                  "errors": errors[:25],
+              }
+
+Outputs:
+  OUBaselineAutomationLogGroupName:
+    Description: CloudWatch Logs log group used by the automation Lambda.
+    Value: !Ref OUBaselineAutomationLogGroup
+  OUBaselineAutomationFunctionName:
+    Description: Lambda function name for the OU baseline automation.
+    Value: !Ref OUBaselineAutomationFunction
+  OUBaselineAutomationRoleArn:
+    Description: IAM role ARN used by the automation Lambda.
+    Value: !GetAtt OUBaselineAutomationRole.Arn
+  PortfolioAccessFunctionName:
+    Condition: AutoAddPortfolioAccessEnabled
+    Description: Lambda function name used to associate the OU engine role with the Account Factory portfolio.
+    Value: !Ref PortfolioAccessFunction
+  PortfolioAccessLogGroupName:
+    Condition: AutoAddPortfolioAccessEnabled
+    Description: CloudWatch Logs log group used by the portfolio access Lambda.
+    Value: !Ref PortfolioAccessLogGroup
+  PortfolioAccessRoleArn:
+    Condition: AutoAddPortfolioAccessEnabled
+    Description: IAM role ARN used by the portfolio access Lambda.
+    Value: !GetAtt PortfolioAccessRole.Arn
+  KickoffTargetOrganizationalUnitId:
+    Description: OU ID provided to the kickoff custom resource.
+    Value: !Ref AutomationTargetOrganizationalUnitId
+  OrganizationalUnitsTagsCleanupFunctionName:
+    Description: Lambda function that removes both automation tags from all organizational units.
+    Value: !Ref OrganizationalUnitsTagsCleanupFunction
+  OrganizationalUnitsTagsCleanupLogGroupName:
+    Description: CloudWatch Logs log group used by the cleanup Lambda.
+    Value: !Ref OrganizationalUnitsTagsCleanupLogGroup
+  OrganizationalUnitsTagsCleanupRoleArn:
+    Description: IAM role ARN used by the cleanup Lambda.
+    Value: !GetAtt OrganizationalUnitsTagsCleanupRole.Arn
