@@ -398,7 +398,7 @@ Let’s take a look at the Accounts Automation workflow. The diagram below illus
       1. The function lists all accounts in the organization and evaluates their tags. 
       2. If an account contains the `TagStartedKey`, it is removed. 
       3. If the `TagCompletedKey` is present, it is also removed. 
-      4. No payload is required to invoke this function. A simple `{ }` payload is sufficient. 
+      4. No payload is required to invoke this function. A simple `{ }` payload is sufficient. <a id="deep-dive-24"></a>
       5. Example output:
    
       ```
@@ -477,7 +477,15 @@ Let’s take a look at the Accounts Automation workflow. The diagram below illus
 
 ## Cleanup
 
-* Begin by invoking the `AccountsTagsCleanupFunction` or `OrganizationalUnitsTagsCleanupFunction` to remove all tags created by the automation.
+* Begin by invoking the `AccountsTagsCleanupFunction` or `OrganizationalUnitsTagsCleanupFunction` to remove all tags created by the automation, as described in **[2.4](#deep-dive-24)**, No payload is required to invoke this function. A simple `{ }` payload is sufficient.
+   Lambda function can be invoked through the AWS Console
+   ![alt text](Images/lambda-console.png)
+   
+   Or simply through the command below
+   ```bash
+   aws lambda invoke   --function-name OrganizationalUnitsTagsCleanupFunction   --payload '{}'   response.json
+   cat response.json
+   ```
 * Once the tags have been cleaned up, proceed with deleting the CloudFormation stacks. This will remove all resources deployed by the solution.
 * If the `PortfolioAccessFunction` was deployed, access to the Account Factory portfolio will be revoked for the associated IAM roles as part of the cleanup process.
 
