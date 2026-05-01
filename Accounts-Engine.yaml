@@ -1539,9 +1539,19 @@ Resources:
               timer.daemon = True
               timer.start()
           
-              sc = boto3.client("servicecatalog", config=CFG)
-          
               try:
+                  startup_delay_seconds = int(_first(props, "StartupDelaySeconds") or "0")
+
+                  if req_type in ("Create", "Update") and startup_delay_seconds > 0:
+                      log.info(
+                          "Waiting %s seconds before processing %s to allow IAM role and policy propagation",
+                          startup_delay_seconds,
+                          event.get("LogicalResourceId"),
+                      )
+                      time.sleep(startup_delay_seconds)
+
+                  sc = boto3.client("servicecatalog", config=CFG)
+
                   if not principal_arn:
                       raise Exception("Missing required property: PrincipalArn (or EngineRoleArn)")
           
@@ -1615,6 +1625,7 @@ Resources:
       PrincipalArn: !GetAtt AccountsEngineRole.Arn
       TargetAccountId: !Ref AutomationTargetAccountId
       PortfolioNameContains: account factory
+      StartupDelaySeconds: 60
 
 Outputs:
   EventRuleName:

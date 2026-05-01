@@ -422,7 +422,8 @@ Let’s take a look at the Accounts Automation workflow. The diagram below illus
       3. On Create or Update:
    
          1. The function discovers the portfolio ID.
-         2. It invokes `associate_principal_with_portfolio()` to grant access to the IAM role `AccountsEngineRole`. 
+         2. It invokes `associate_principal_with_portfolio()` to grant access to the IAM role `AccountsEngineRole`.
+         3. To help avoid race conditions, a delay is introduced in the Lambda function. By default, this delay is set to 60 seconds and is controlled by the `StartupDelaySeconds` property. This behavior applies to both the Accounts Engine and the OUs Engine. 
       4. On Delete:
    
          1. The function extracts the portfolio ID and principal ARN from the `PhysicalResourceId`.

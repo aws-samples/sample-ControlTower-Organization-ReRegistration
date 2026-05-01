@@ -1403,9 +1403,20 @@ Resources:
               sc = boto3.client("servicecatalog", config=CFG)
 
               try:
+                  startup_delay_seconds = int(_first(props, "StartupDelaySeconds") or "0")
+
+                  if req_type in ("Create", "Update") and startup_delay_seconds > 0:
+                      log.info(
+                          "Waiting %s seconds before processing %s to allow IAM role and policy propagation",
+                          startup_delay_seconds,
+                          event.get("LogicalResourceId"),
+                      )
+                      time.sleep(startup_delay_seconds)
+
+                  sc = boto3.client("servicecatalog", config=CFG)
+
                   if not principal_arn:
                       raise Exception("Missing required property: PrincipalArn (or EngineRoleArn)")
-
                   if not portfolio_id and target_account_id:
                       product_id = _lookup_product_id_for_target(sc, target_account_id)
                       if product_id:
@@ -1479,6 +1490,7 @@ Resources:
     Properties:
       ServiceToken: !GetAtt PortfolioAccessFunction.Arn
       PrincipalArn: !GetAtt OUBaselineAutomationRole.Arn
+      StartupDelaySeconds: 60
       PortfolioNameContains: AWS Control Tower Account Factory Portfolio
 
   OrganizationalUnitsTagsCleanupRole:
